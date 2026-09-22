@@ -22,7 +22,7 @@ use icicle_vm::{
 
 use crate::{
     fuzzware::uc_engine,
-    mmio::FuzzwareMmioHandler,
+    mmio::{FuzzwareMmioHandler, ReadContextSource},
     unicorn_api::{Context, map_uc_err},
 };
 pub use unicorn_api::{IRQ_NUMBER_ADDR, TIMER_CHOICE_ADDR};
@@ -67,7 +67,12 @@ impl<T> CortexmTarget<T> {
     }
 }
 
-impl<I: IoMemory + 'static> CortexmTarget<FuzzwareMmioHandler<I>> {
+// The read context (pc, icount, interrupt) has to reach the source before it
+// serves a read, because the source's tracer is what records the input offset a
+// taint analysis attributes bytes to.  A source that cannot receive it would
+// silently lose that attribution, so the bound is stated rather than worked
+// around.
+impl<I: IoMemory + ReadContextSource + 'static> CortexmTarget<FuzzwareMmioHandler<I>> {
     pub fn fuzzware_init(
         &mut self,
         config: &config::FirmwareConfig,

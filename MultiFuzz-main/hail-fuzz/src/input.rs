@@ -3,7 +3,10 @@ use std::io::Read;
 use anyhow::Context;
 use hashbrown::HashMap;
 
-use icicle_cortexm::mmio::{FuzzwareMmioHandler, ReadContext, ReadContextSource};
+use icicle_cortexm::{
+    CortexmTarget,
+    mmio::{FuzzwareMmioHandler, ReadContext, ReadContextSource},
+};
 use icicle_vm::cpu::mem::{IoMemory, MemError, MemResult};
 
 use crate::debugging::trace::IoTracerAny;

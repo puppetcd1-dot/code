@@ -47,8 +47,18 @@ impl AccessContext {
         Self { pc, addr, occ }
     }
 
-    pub const fn site(&self) -> (u64, StreamKey) {
-        (self.pc, self.addr)
+    /// Identity of the *site* itself, with no occurrence attached (`occ == 0`).
+    ///
+    /// Loop gating is a property of the read site -- this site's value decides
+    /// how much of *that* site is consumed -- and not of one occurrence: two
+    /// nested back edges can reap the same source occurrence, and they describe
+    /// the same loop.  The bound is therefore keyed by the sites, and the
+    /// occurrences that actually opened it are carried alongside it
+    /// (`LoopBound::source_occs` in `semantic_taint`).
+    ///
+    /// Occurrences are 1-based, so `occ == 0` can never collide with a real read.
+    pub const fn site(pc: u64, addr: StreamKey) -> Self {
+        Self { pc, addr, occ: 0 }
     }
 }
 
@@ -84,14 +94,6 @@ impl TaintIndex {
     pub fn contexts_in_tag(&self, tag: &TaintTag) -> Vec<AccessContext> {
         tag.ids.iter().filter_map(|id| self.resolve(*id)).collect()
     }
-
-    pub fn len(&self) -> usize {
-        self.contexts.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.contexts.is_empty()
-    }
 }
 
 /// A set of interned read sites that a value's bits derive from.
@@ -103,6 +105,9 @@ pub struct TaintTag {
 }
 
 impl TaintTag {
+    // Deliberately not SCREAMING_CASE: `TaintTag::Clean` is read far more often
+    // than it is written, and the name is part of how the pass explains itself.
+    #[allow(non_upper_case_globals)]
     pub const Clean: TaintTag = TaintTag { ids: Vec::new() };
 
     pub fn single(id: u32) -> Self {
@@ -111,14 +116,6 @@ impl TaintTag {
 
     pub fn is_clean(&self) -> bool {
         self.ids.is_empty()
-    }
-
-    pub fn ids(&self) -> &[u32] {
-        &self.ids
-    }
-
-    pub fn len(&self) -> usize {
-        self.ids.len()
     }
 
     /// Union of two provenance sets.
@@ -240,6 +237,7 @@ impl ShadowState {
         }
     }
 
+    #[cfg(test)]
     pub fn tracked_memory_bytes(&self) -> usize {
         self.mem.len()
     }
@@ -278,7 +276,6 @@ mod tests {
         assert_ne!(a, b);
 
         let both = a.union(&b);
-        assert_eq!(both.len(), 2);
         assert_eq!(
             shadow.index.contexts_in_tag(&both),
             vec![ctx(0x100, 0x5800_0000), ctx(0x200, 0x5800_0004)]

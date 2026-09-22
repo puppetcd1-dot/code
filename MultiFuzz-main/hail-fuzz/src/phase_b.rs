@@ -20,6 +20,7 @@
 //! Everything here runs out of band (replay); the fuzzing loop never sees it.
 
 use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -105,6 +106,30 @@ fn read_regular_memory(cpu: &mut Cpu, addr: u64, size: u8) -> Option<u64> {
 ///
 /// Every method carries *provenance* (the read sites a value came from), never a
 /// byte value, so the consumer never has to guess which input bytes were meant.
+/// Where an equality comparison happened, and how the compared value's taint was
+/// resolved.
+///
+/// Both fields are audit evidence rather than inputs to the decision: a magic
+/// event without its comparison PC cannot be traced back to the instruction that
+/// stated the constant, and that is what makes a suspicious discriminant
+/// attributable at all.  `from_fallback` says whether the taint came from a
+/// definition inside the group being interpreted or from the register file's
+/// shadow.  A fallback-sourced tag is legitimate -- a call returns into a new
+/// group, so the return register has no definition there -- but it is also how a
+/// stale value from an unrelated block can reach an unrelated comparison, so the
+/// distinction is recorded rather than silently trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MagicEvidence {
+    pub compare_pc: u64,
+    pub from_fallback: bool,
+}
+
+impl MagicEvidence {
+    pub const fn at(compare_pc: u64) -> Self {
+        Self { compare_pc, from_fallback: false }
+    }
+}
+
 pub trait PhaseBObserver {
     /// A load at a known MMIO read site executed while interpreting this block.
     fn on_source_load(&mut self, _context: AccessContext, _size: u8) {}
@@ -124,23 +149,56 @@ pub trait PhaseBObserver {
     ///
     /// This is the magic rule: the firmware is stating the value it expects to
     /// read, and the sources say which input bytes it expects it from.
-    fn on_magic_compare(&mut self, _sources: &[AccessContext], _value: u64, _confidence: f32) {}
+    fn on_magic_compare(
+        &mut self,
+        _sources: &[AccessContext],
+        _value: u64,
+        _confidence: f32,
+        _evidence: MagicEvidence,
+    ) {
+    }
+
+    /// A tainted value was written to a peripheral register.
+    ///
+    /// This is the firmware driving its own device, not a use of the input as
+    /// data, so it produces no role -- but it is the counter-evidence that keeps a
+    /// status register's own read-modify-write from being read as a payload copy.
+    fn on_device_write(&mut self, _sources: &[AccessContext], _pc: u64, _addr: u64) {}
 
     /// A tainted value gated a loop that read `target` `count` times.
     ///
     /// This is the length rule: the source bounds how much of the target is
-    /// consumed.
-    fn on_loop_bound(&mut self, _source: AccessContext, _target: AccessContext, _count: u64) {}
+    /// consumed.  `count` is the *site total* -- how many times the target was
+    /// read in this pass -- which is the quantity comparable with the length
+    /// field's own value.  `gated_count` counts only the reads that actually
+    /// happened while the gate was in effect, which is what identifies the
+    /// payload bytes; the two differ for a loop whose first read precedes the
+    /// branch that establishes the gate.
+    ///
+    /// A loop whose body re-reads its own length field reports a bound where
+    /// `target` is the source's own site.  That is the same-site approximation the
+    /// pass relies on for helper-style byte reads (one read site reused for every
+    /// byte), which cannot be told apart from a self-referential loop; consumers
+    /// should expect it rather than treat it as a parsing mistake.
+    fn on_loop_bound(
+        &mut self,
+        _source: AccessContext,
+        _source_occs: &[u32],
+        _target: AccessContext,
+        _count: u64,
+        _gated_count: u64,
+    ) {
+    }
 
     /// One read of `target` that happened while a loop bound was in effect.
     ///
     /// These are the bytes a length field pays for, i.e. the payload.
-    fn on_bounded_read(&mut self, _target: AccessContext, _occ: u32) {}
+    fn on_bounded_read(&mut self, _read: AccessContext) {}
 
     /// A load whose *address* derived from tainted input: a table lookup indexed
     /// by input bytes.  The value read out is clean, so without this the taint
     /// chain dies here; the caller can also use the event as checksum evidence.
-    fn on_table_load(&mut self, _addr_sources: &[AccessContext]) {}
+    fn on_table_load(&mut self, _addr_sources: &[AccessContext], _pc: u64) {}
 
     /// A value that went through a mixing chain (>= 2 combining steps) and is
     /// therefore checksum-like rather than a plain payload byte.
@@ -152,10 +210,25 @@ pub trait PhaseBObserver {
 /// Only loops are recorded here: a forward branch (an IT-block guard, an
 /// interrupt re-entry) gates a decision, not an amount, so it carries no length
 /// information and is filtered out at the branch itself.
+///
+/// Both sides of the key are read *sites* ([`AccessContext::site`], `occ == 0`):
+/// the relation "this field's value decides how much of that site is read" is a
+/// property of the sites, and a length field re-read inside the loop it gates
+/// would otherwise produce one row per occurrence of the same bound.  Which
+/// occurrences opened a gate is carried in `source_occs` instead.
 #[derive(Debug, Clone, Default)]
 struct CtrlObs {
-    /// Reads of the target that happened while this gate was in effect.
-    bounded_reads: Vec<AccessContext>,
+    /// Occurrences of the source *site* that opened a gate on this target.
+    source_occs: BTreeSet<u32>,
+    /// Reads of the target that happened while a gate was in effect.
+    ///
+    /// A *set*, not a list: two gates can be live at once on the same source
+    /// site (two nested back edges whose conditions both derive from it, which
+    /// the per-branch keys cannot deduplicate because their pcs differ), and one
+    /// read must count once towards the bound, not once per live gate.  It also
+    /// makes `gated_count <= count` structural: every entry is a distinct read of
+    /// one site, so the set can never be larger than the number of reads.
+    bounded_reads: BTreeSet<AccessContext>,
 }
 
 /// How a user op (custom pcode operation) may move taint.
@@ -197,7 +270,15 @@ const MAX_GROUP_STEPS: usize = 256;
 /// Dynamic taint interpreter operating one block at a time.
 pub struct PhaseBEngine {
     shadow: ShadowState,
-    read_sites: HashMap<u64, StreamKey>,
+    /// Which streams each PC was seen reading, from the discovery pass.
+    ///
+    /// A PC is not a site by itself: a shared `read_byte()` helper serves whichever
+    /// peripheral pointer its caller passed, so one PC can read several streams,
+    /// each at its own address.  Keying by PC alone collapsed those into one, which
+    /// is why such sites used to be dropped outright.  The pair is the real
+    /// identity: every `(pc, stream)` is its own pseudo-site with its own read
+    /// sequence.
+    read_sites: HashMap<u64, Vec<StreamKey>>,
     mmio_ranges: Vec<Range<u64>>,
     /// The only memory space that belongs to the guest.  Everything at or above
     /// `pcode::RESERVED_SPACE_END` is emulator bookkeeping (the coverage bitmap
@@ -212,10 +293,21 @@ pub struct PhaseBEngine {
     /// Variables produced by mixing operations (xor/shift/multiply/non-constant
     /// and), i.e. candidates for a checksum accumulator.
     def_mixed: HashSet<VarId>,
+    /// Registers that hold a mixed value.  Unlike `def_mixed` this is scoped to
+    /// the pass, not the block: a CRC accumulator is built inside a loop and
+    /// compared after the loop has exited, in a different group, where the
+    /// per-block definition table has long been cleared.
+    mixed_regs: HashSet<VarId>,
     /// Variables produced by `value & mask`, mapped to that mask.  A following
     /// `== mask` is a position test, not a protocol constant; a comparison against
     /// any other constant is still a real discriminant.
     def_masked: HashMap<VarId, u64>,
+    /// Flag registers of the loaded spec (`ZR`, `CY`, `NG`, `OV`, ...).
+    ///
+    /// Every conditional branch lifts to a comparison against a flag (`beq` is
+    /// `ZR == 0x1`, `bpl` is `NG == 0x0`), so a flag whose taint came from input
+    /// would otherwise report 0 or 1 as a value the input should take.
+    flag_vars: HashSet<VarId>,
     /// Whether a table lookup happened in the current block, which is the
     /// checksum signal for a following mixed store.
     table_load_in_block: bool,
@@ -239,8 +331,26 @@ pub struct PhaseBEngine {
     /// High-water mark of the block table, used to notice a code cache flush.
     max_block_index: usize,
     /// Tainted branch conditions currently gating subsequent reads.
-    gating: Vec<AccessContext>,
-    gating_set: HashSet<AccessContext>,
+    ///
+    /// Keyed by the branch that established the gate as well as the source it came
+    /// from: one branch instruction belongs to exactly one loop, so a gate can be
+    /// retired precisely when that branch takes its exit, and the same source
+    /// gating two different loops is no longer deduplicated away.
+    gating: Vec<(AccessContext, u64)>,
+    gating_set: HashSet<(AccessContext, u64)>,
+    /// Every read that a gate has ever bounded (append-only).
+    ///
+    /// Used to reject a *new* gate whose source is a byte some earlier gate paid
+    /// for: in a terminator loop (`while (buf[i] != 0)`) the byte just read becomes
+    /// the next iteration's gate source, which would otherwise turn the whole
+    /// payload into a length field.  A genuine second length field is read after
+    /// the previous loop has exited and is therefore inside no bound.
+    bounded_read_set: HashSet<AccessContext>,
+    /// One entry per loop bound: which source site gated which target site.
+    ///
+    /// Keyed by sites (see [`CtrlObs`]): an occurrence-keyed map would report a
+    /// re-read length field once per occurrence and, when two nested back edges
+    /// derive their condition from the same read, record every bounded read twice.
     ctrl_obs: HashMap<(AccessContext, AccessContext), CtrlObs>,
     /// User ops classified as pure data / no-output, by id.
     pure_user_ops: HashSet<pcode::PcodeOpId>,
@@ -275,12 +385,15 @@ struct SubInfo {
     /// The other operand when it is a constant: this is the compared value.
     constant: Option<u64>,
     /// The other operand when it is not a constant (literal-pool path).
+    ///
+    /// Only meaningful when `constant` is `None`: for the constant form there is
+    /// no second operand, and this field holds the base itself.
     other: Value,
     is_add: bool,
 }
 
 impl PhaseBEngine {
-    pub fn new(read_sites: HashMap<u64, StreamKey>, mmio_ranges: Vec<Range<u64>>) -> Self {
+    pub fn new(read_sites: HashMap<u64, Vec<StreamKey>>, mmio_ranges: Vec<Range<u64>>) -> Self {
         Self {
             shadow: ShadowState::new(),
             read_sites,
@@ -290,7 +403,9 @@ impl PhaseBEngine {
             def_taint: HashMap::new(),
             def_sub: HashMap::new(),
             def_mixed: HashSet::new(),
+            mixed_regs: HashSet::new(),
             def_masked: HashMap::new(),
+            flag_vars: HashSet::new(),
             table_load_in_block: false,
             cur_pc: 0,
             cur_group_entry: 0,
@@ -304,6 +419,7 @@ impl PhaseBEngine {
             max_block_index: 0,
             gating: Vec::new(),
             gating_set: HashSet::new(),
+            bounded_read_set: HashSet::new(),
             ctrl_obs: HashMap::new(),
             pure_user_ops: HashSet::new(),
             no_output_user_ops: HashSet::new(),
@@ -311,6 +427,8 @@ impl PhaseBEngine {
             loads_interpreted: 0,
             skipped_space_ops: 0,
             stack_stores_skipped: 0,
+            device_writes: 0,
+            demoted_discriminants: 0,
             table_loads: 0,
             early_stops: 0,
             panic_disarmed: false,
@@ -324,9 +442,25 @@ impl PhaseBEngine {
         self.sp_varnode = sp;
     }
 
+    /// Declare one read site: `pc` reads `stream`.
+    ///
+    /// Calling it twice with different streams makes the PC a multiplexed site,
+    /// which the engine resolves per read by the concrete load address.
+    pub fn pin_site(&mut self, pc: u64, stream: StreamKey) {
+        let streams = self.read_sites.entry(pc).or_default();
+        if !streams.contains(&stream) {
+            streams.push(stream);
+        }
+    }
+
+    /// Register the flag registers resolved from the loaded spec (see `flag_vars`).
+    pub fn set_flag_vars(&mut self, ids: impl IntoIterator<Item = VarId>) {
+        self.flag_vars.extend(ids);
+    }
+
     /// Install the user ops that are safe to interpret as pure data movement,
     /// resolved by name from the loaded SLEIGH spec.
-    pub fn set_user_ops(&mut self, ops: impl IntoIterator<Item = (pcode::PcodeOpId, UserOpKind)>) {
+    fn set_user_ops(&mut self, ops: impl IntoIterator<Item = (pcode::PcodeOpId, UserOpKind)>) {
         for (id, kind) in ops {
             match kind {
                 UserOpKind::PureData => {
@@ -368,7 +502,7 @@ impl PhaseBEngine {
     /// Reset all per-pass state and refresh the runtime config for a new pass.
     pub fn reset_pass(
         &mut self,
-        read_sites: HashMap<u64, StreamKey>,
+        read_sites: HashMap<u64, Vec<StreamKey>>,
         mmio_ranges: Vec<Range<u64>>,
     ) {
         self.shadow = ShadowState::new();
@@ -378,6 +512,7 @@ impl PhaseBEngine {
         self.def_taint.clear();
         self.def_sub.clear();
         self.def_mixed.clear();
+        self.mixed_regs.clear();
         self.def_masked.clear();
         self.table_load_in_block = false;
         self.cur_pc = 0;
@@ -387,9 +522,14 @@ impl PhaseBEngine {
         // `block_addrs` is a map of the lifted program, not of this pass: keep it.
         self.gating.clear();
         self.gating_set.clear();
+        // Same lifetime as `ctrl_obs`: the bounded reads it mirrors are part of the
+        // pass's evidence and are never removed during it.
+        self.bounded_read_set.clear();
         self.ctrl_obs.clear();
         self.pending_source_loads.clear();
         self.loads_interpreted = 0;
+        self.device_writes = 0;
+        self.demoted_discriminants = 0;
     }
 
     /// Concrete value of an input, consulting in-block defs first, then `env`.
@@ -415,20 +555,32 @@ impl PhaseBEngine {
     }
 
     fn taint_in(&self, v: Value) -> TaintTag {
+        self.resolve_taint(v).0
+    }
+
+    /// Taint of a value, plus whether it came from the register file's shadow.
+    ///
+    /// `from_fallback` means the value had no definition in the group currently
+    /// being interpreted, so its tag is whatever the shadow holds from the block
+    /// that last wrote that register.  That is required for anything crossing a
+    /// call or a block boundary -- a callee's return value has no local
+    /// definition -- and it is also how a stale tag can reach an unrelated
+    /// comparison, so the distinction is reported rather than hidden.
+    fn resolve_taint(&self, v: Value) -> (TaintTag, bool) {
         match v {
-            Value::Const(..) => TaintTag::Clean,
+            Value::Const(..) => (TaintTag::Clean, false),
             Value::Var(vn) => {
                 if vn.is_invalid() {
-                    return TaintTag::Clean;
+                    return (TaintTag::Clean, false);
                 }
                 if let Some(t) = self.def_taint.get(&vn.id) {
-                    return t.clone();
+                    return (t.clone(), false);
                 }
                 if vn.id > 0 {
-                    self.shadow.reg_tag(vn.id)
+                    (self.shadow.reg_tag(vn.id), true)
                 }
                 else {
-                    TaintTag::Clean
+                    (TaintTag::Clean, false)
                 }
             }
         }
@@ -438,6 +590,24 @@ impl PhaseBEngine {
         if out.is_invalid() {
             return;
         }
+        // A definition replaces whatever the destination held before, so the
+        // "derived from a mixing chain" marker is reset here and re-applied by the
+        // arms that actually mix.  A monotonically growing set would instead let a
+        // CRC register keep its marker after being reloaded with fresh input, and
+        // every later comparison on that register -- a `\r` separator test, say --
+        // would then be dismissed as a checksum.  Registers are reused constantly
+        // at -O2, and a CRC accumulator and a separator compare often share the
+        // same low register number.
+        self.def_mixed.remove(&out.id);
+        // The same reasoning applies to the other per-variable derivation notes:
+        // sleigh reuses temporary ids heavily within a block, and a stale entry
+        // would make a later comparison look like it came from an earlier
+        // subtraction or mask.
+        self.def_masked.remove(&out.id);
+        self.def_sub.remove(&out.id);
+        if out.id > 0 {
+            self.mixed_regs.remove(&out.id);
+        }
         self.def_concrete.insert(out.id, concrete);
         self.def_taint.insert(out.id, taint.clone());
         if out.id > 0 {
@@ -445,8 +615,38 @@ impl PhaseBEngine {
         }
     }
 
+    /// Record whether the value just defined came out of a mixing chain.
+    ///
+    /// Called after [`Self::set_def`] by the arms that either mix or merely move a
+    /// value; everything else keeps the cleared (fresh) state.
+    fn note_mixed(&mut self, out: VarNode, is_mixed: bool) {
+        if out.is_invalid() {
+            return;
+        }
+        if is_mixed {
+            // Block-local for every variable (a temporary only lives that long),
+            // and additionally remembered across blocks for registers.
+            self.def_mixed.insert(out.id);
+            if out.id > 0 {
+                self.mixed_regs.insert(out.id);
+            }
+        }
+        else {
+            self.def_mixed.remove(&out.id);
+            self.mixed_regs.remove(&out.id);
+        }
+    }
+
     fn contexts_of(&self, tag: &TaintTag) -> Vec<AccessContext> {
         self.shadow.index.contexts_in_tag(tag)
+    }
+
+    /// How many times a read *site* was read over the whole pass.
+    ///
+    /// `target_reads` holds one counter per site, stored under that site's first
+    /// occurrence, so a site (`occ == 0`) has to be translated before lookup.
+    fn site_read_count(&self, site: AccessContext) -> u64 {
+        self.target_reads.get(&AccessContext::new(site.pc, site.addr)).copied().unwrap_or(0)
     }
 
     #[cfg(test)]
@@ -456,29 +656,51 @@ impl PhaseBEngine {
 
     /// Emit one observation per loop-bound pair found during the pass.
     ///
+    /// One event per (source *site*, target *site*) pair, carrying the
+    /// occurrences of the source that opened a gate, the target's total read
+    /// count, and the reads that happened while the gate was in effect.
+    /// `gated_count` is never greater than `count`: the reads are held as a set,
+    /// so a read gated by two live gates is still one read (see [`CtrlObs`]).
+    ///
     /// Called after the run: the number of target reads is only complete once
     /// execution has finished.
     pub fn emit_observations(&mut self) {
-        let mut events = Vec::new();
+        let mut events: Vec<(AccessContext, Vec<u32>, AccessContext, u64, Vec<AccessContext>)> =
+            Vec::new();
         for (&(source, target), obs) in &self.ctrl_obs {
-            // Counts are per read *site*; the observation key carries a specific
-            // occurrence, so look the site up explicitly.
-            let count = self
-                .target_reads
-                .get(&AccessContext::new(target.pc, target.addr))
-                .copied()
-                .unwrap_or(0);
+            // `count` is the number of reads of the target *site* over the whole
+            // pass, which is the quantity a length field's value can be compared
+            // against (see the confirmation rule in `semantic_taint`).
+            let count = self.site_read_count(target);
             // Require >= 3 reads so a two-iteration prologue cannot masquerade as
             // a length field.
-            if count >= 3 {
-                events.push((source, target, count, obs.bounded_reads.clone()));
+            if count < 3 {
+                continue;
             }
+            // `bounded_reads` is a set of distinct reads of that one site, so a
+            // bound can never claim more reads than the site ever had.  Two live
+            // gates on one source used to be able to double this; that was the
+            // bug this invariant now guards against.
+            debug_assert!(
+                obs.bounded_reads.len() as u64 <= count,
+                "a bound cannot cover more reads than its target site had: {} > {count} \
+                 (source {source:?}, target {target:?})",
+                obs.bounded_reads.len(),
+            );
+            let bounded: Vec<AccessContext> = obs.bounded_reads.iter().copied().collect();
+            let occs: Vec<u32> = obs.source_occs.iter().copied().collect();
+            events.push((source, occs, target, count, bounded));
         }
+        // Canonical order: these events become a document that the aligned
+        // parent/mutant harness diffs, so the order must not depend on the hash
+        // map's per-process seed.
+        events.sort_unstable_by_key(|(source, _, target, _, _)| (*source, *target));
         if let Some(observer) = self.observer.as_mut() {
-            for (source, target, count, bounded) in events {
-                observer.on_loop_bound(source, target, count);
+            for (source, occs, target, count, bounded) in events {
+                let gated_count = bounded.len() as u64;
+                observer.on_loop_bound(source, &occs, target, count, gated_count);
                 for read in bounded {
-                    observer.on_bounded_read(target, read.occ);
+                    observer.on_bounded_read(read);
                 }
             }
         }
@@ -490,9 +712,12 @@ impl PhaseBEngine {
             loads_interpreted: self.loads_interpreted,
             skipped_space_ops: self.skipped_space_ops,
             stack_stores_skipped: self.stack_stores_skipped,
+            device_writes: self.device_writes,
+            demoted_discriminants: self.demoted_discriminants,
             table_loads: self.table_loads,
             early_stops: self.early_stops,
             panic_disarmed: self.panic_disarmed,
+            evictions: self.shadow.evictions(),
         }
     }
 }
@@ -647,6 +872,11 @@ impl PhaseBEngine {
         space == self.ram_space || space == pcode::REGISTER_SPACE
     }
 
+    /// Whether an address names a peripheral register rather than memory.
+    fn is_device_address(&self, addr: u64) -> bool {
+        self.mmio_ranges.iter().any(|range| range.contains(&addr))
+    }
+
     /// Interpret one block's P-code and its exit gating, WITHOUT resetting the
     /// per-block definition state (so it can be chained across a group's
     /// sub-blocks).  `cur_pc` is advanced only by `InstructionMarker`s, so a
@@ -672,7 +902,24 @@ impl PhaseBEngine {
                     let addr_input = stmt.inputs.first();
                     let addr = self.concrete_in(addr_input, env);
 
-                    if let Some(&key) = self.read_sites.get(&self.cur_pc) {
+                    // Which stream this read belongs to.  A PC that serves one
+                    // stream is that site's stream; a PC that serves several is
+                    // resolved per *read* by the concrete load address, which keeps
+                    // a shared helper's callers' streams apart instead of merging
+                    // or dropping them.
+                    let key = self.read_sites.get(&self.cur_pc).and_then(|streams| {
+                        match streams.len() {
+                            0 => None,
+                            1 => streams.first().copied(),
+                            _ => addr.and_then(|addr| {
+                                streams
+                                    .iter()
+                                    .copied()
+                                    .find(|stream| *stream & 0xffff_ffff == addr & 0xffff_ffff)
+                            }),
+                        }
+                    });
+                    if let Some(key) = key {
                         // `occ` is assigned in interpretation order, which is the
                         // order the CPU performs the reads in.  Note that `occ`,
                         // not the address, is what separates two reads: a FIFO read
@@ -688,17 +935,38 @@ impl PhaseBEngine {
                         // A tainted loop gate seen earlier bounds how much of this
                         // stream is consumed.  Only loop gates reach `gating` (see
                         // the exit handling), so every entry here is a real bound.
-                        let gating: Vec<AccessContext> = self.gating.clone();
-                        for src in gating {
-                            if src.addr == ctx.addr {
+                        //
+                        // The live gates are folded by source *site* first: two
+                        // nested back edges can both take their condition from the
+                        // same read site, and they describe the same bound, so one
+                        // read must be credited to it once rather than once per
+                        // live gate.  Folding here (and not only at the key) is
+                        // what keeps `gated_count` a count of reads.
+                        let mut gating_sites: BTreeMap<(u64, StreamKey), BTreeSet<u32>> =
+                            BTreeMap::new();
+                        for (src, _) in &self.gating {
+                            gating_sites.entry((src.pc, src.addr)).or_default().insert(src.occ);
+                        }
+                        let ctx_site = AccessContext::site(ctx.pc, ctx.addr);
+                        for ((site_pc, site_stream), occs) in gating_sites {
+                            // Only the reads that *opened* a gate are excluded: a
+                            // gate cannot bound its own source read.  Later
+                            // occurrences of the same site are exactly the helper
+                            // style payload (`bl read_byte` reusing one site) that
+                            // has to stay bounded, and a second length field read at
+                            // another context of the same peripheral must stay
+                            // visible too.
+                            let source_site = AccessContext::site(site_pc, site_stream);
+                            if source_site == ctx_site && occs.contains(&ctx.occ) {
                                 continue;
                             }
                             // Key by the target *site* so a loop accumulates all of
                             // its bounded reads into one observation, while the
                             // individual occurrences are kept for payload marking.
-                            let target = AccessContext::new(ctx.pc, ctx.addr);
-                            let obs = self.ctrl_obs.entry((src, target)).or_default();
-                            obs.bounded_reads.push(ctx);
+                            let obs = self.ctrl_obs.entry((source_site, ctx_site)).or_default();
+                            obs.source_occs.extend(occs);
+                            obs.bounded_reads.insert(ctx);
+                            self.bounded_read_set.insert(ctx);
                         }
 
                         // LiveEnv returns None for MMIO reads (it must not consume
@@ -728,8 +996,9 @@ impl PhaseBEngine {
                             self.table_loads += 1;
                             self.table_load_in_block = true;
                             let sources = self.contexts_of(&addr_tag);
+                            let load_pc = self.cur_pc;
                             if let Some(observer) = self.observer.as_mut() {
-                                observer.on_table_load(&sources);
+                                observer.on_table_load(&sources, load_pc);
                             }
                         }
                         let tag = val_tag.union(&addr_tag);
@@ -761,6 +1030,21 @@ impl PhaseBEngine {
                             if self.in_stack_window(a) {
                                 self.stack_stores_skipped += 1;
                             }
+                            else if self.is_device_address(a) {
+                                // A write to a peripheral register is the firmware
+                                // driving its own device, not a use of the input as
+                                // data.  It is reported separately for exactly that
+                                // reason: a read-modify-write of an interrupt-clear
+                                // register is neither a payload copy nor a checksum,
+                                // and calling it one is what made the target's
+                                // status bytes look like payload.
+                                self.device_writes += 1;
+                                let sources = self.contexts_of(&tag);
+                                let pc = self.cur_pc;
+                                if let Some(observer) = self.observer.as_mut() {
+                                    observer.on_device_write(&sources, pc, a);
+                                }
+                            }
                             else {
                                 let sources = self.contexts_of(&tag);
                                 if self.operand_mixed(stmt.inputs.second()) {
@@ -791,6 +1075,19 @@ impl PhaseBEngine {
                     let c = self.concrete_in(src, env);
                     let t = self.taint_in(src);
                     self.set_def(stmt.output, c, t);
+
+                    // These are pure moves of the low bits, so a derived-value
+                    // property travels with them: `t = x & 0xF0; r2 = t` is still
+                    // a mask test, and a moved accumulator is still a checksum.
+                    if !stmt.output.is_invalid() {
+                        if let Value::Var(vn) = src {
+                            if let Some(mask) = self.def_masked.get(&vn.id).copied() {
+                                self.def_masked.insert(stmt.output.id, mask);
+                            }
+                        }
+                        let mixed = self.operand_mixed(src);
+                        self.note_mixed(stmt.output, mixed);
+                    }
                 }
 
                 Op::Subpiece(offset) => {
@@ -807,6 +1104,9 @@ impl PhaseBEngine {
                         mask_to_size(shifted, stmt.output.size)
                     });
                     self.set_def(stmt.output, c, t);
+                    // A slice of a mixed value is still that value's low bits.
+                    let mixed = self.operand_mixed(src);
+                    self.note_mixed(stmt.output, mixed);
                 }
 
                 Op::IntAdd | Op::IntSub => {
@@ -860,15 +1160,36 @@ impl PhaseBEngine {
                             // `value & mask` extracts bits: the result is a
                             // position test, not the value the firmware compares.
                             self.def_masked.insert(stmt.output.id, mask.expect("checked"));
+                            // A mask does not undo a mixing chain, though: the final
+                            // `crc & 0xFFFF` before a comparison is still a checksum.
+                            // Only an *already mixed* operand propagates here --
+                            // tainting alone must not, or `input & 0xF0 == 0xA0`
+                            // would be demoted from a discriminant to a checksum.
+                            let mixed = self.operand_mixed(a) || self.operand_mixed(b);
+                            self.note_mixed(stmt.output, mixed);
                         }
-                        else if !ta.is_clean()
-                            || !tb.is_clean()
-                            || self.operand_mixed(a)
-                            || self.operand_mixed(b)
+                        else if creates_mixing(stmt.op)
+                            && (!ta.is_clean()
+                                || !tb.is_clean()
+                                || self.operand_mixed(a)
+                                || self.operand_mixed(b))
                         {
                             // A combining step applied to tainted or already-mixed
-                            // data: this is a candidate checksum accumulator.
-                            self.def_mixed.insert(stmt.output.id);
+                            // data: this is a candidate checksum accumulator.  The
+                            // register copy of the marker outlives the block so the
+                            // check still works after the loop exits into another
+                            // group.
+                            //
+                            // Only operations that fold two values together qualify.
+                            // `& mask`, `| bit` and `<< n` merely move bits, so they
+                            // preserve the marker (above) but must not create one: a
+                            // UART byte masked with the port table entry is a mask,
+                            // and treating it as a mixing step turned the byte's own
+                            // store into checksum evidence.
+                            self.note_mixed(stmt.output, true);
+                        }
+                        else {
+                            self.note_mixed(stmt.output, false);
                         }
                     }
                 }
@@ -952,6 +1273,10 @@ impl PhaseBEngine {
                 Op::IntNot | Op::IntNegate | Op::IntCountOnes | Op::IntCountLeadingZeroes => {
                     let t = self.taint_in(stmt.inputs.first());
                     self.set_def(stmt.output, None, t);
+                    // Bit manipulation of a mixed value stays part of that value's
+                    // mixing chain.
+                    let mixed = self.operand_mixed(stmt.inputs.first());
+                    self.note_mixed(stmt.output, mixed);
                 }
 
                 Op::BoolNot => {
@@ -977,6 +1302,9 @@ impl PhaseBEngine {
                         _ => None,
                     };
                     self.set_def(stmt.output, c, t);
+                    let mixed =
+                        self.operand_mixed(a) || self.operand_mixed(b);
+                    self.note_mixed(stmt.output, mixed);
                 }
 
                 Op::PcodeOp(id) => {
@@ -986,6 +1314,8 @@ impl PhaseBEngine {
                         // value is left unknown rather than guessed.
                         let t = self.taint_in(stmt.inputs.first());
                         self.set_def(stmt.output, None, t);
+                        let mixed = self.operand_mixed(stmt.inputs.first());
+                        self.note_mixed(stmt.output, mixed);
                     }
                     else if self.no_output_user_ops.contains(&id) {
                         // Produces no p-code output; it must not be mistaken for an
@@ -1017,23 +1347,34 @@ impl PhaseBEngine {
                 // gates a decision, and the fact that it was reached twice says
                 // nothing about how much input is consumed.
                 if !cond_tag.is_clean() {
+                    let branch_pc = self.cur_pc;
                     if let Some(loops_back) = self.branch_loops_back(block, cond, env) {
-                        let contexts = self.contexts_of(&cond_tag);
                         if loops_back {
-                            for src in contexts {
-                                if self.gating_set.insert(src) {
-                                    self.gating.push(src);
+                            for src in self.contexts_of(&cond_tag) {
+                                // Already an active gate for this loop.
+                                if self.gating_set.contains(&(src, branch_pc)) {
+                                    continue;
                                 }
+                                // A byte some earlier gate already paid for is the
+                                // next iteration of that same loop, not a new field.
+                                if self.bounded_read_set.contains(&src) {
+                                    continue;
+                                }
+                                self.gating_set.insert((src, branch_pc));
+                                self.gating.push((src, branch_pc));
                             }
                         }
                         else {
                             // The loop exited, so the gate is over.  Without this
                             // the bound would keep labelling every later read of
-                            // every other stream as payload.
-                            for src in &contexts {
-                                self.gating_set.remove(src);
-                            }
-                            self.gating.retain(|src| !contexts.contains(src));
+                            // every other stream as payload.  Matching on the branch
+                            // pc retires every gate that branch opened in one go,
+                            // which is what a terminator loop needs: its exit
+                            // condition carries only the last iteration's byte,
+                            // while the gate that is still live was opened by the
+                            // first one.
+                            self.gating.retain(|(_, pc)| *pc != branch_pc);
+                            self.gating_set.retain(|(_, pc)| *pc != branch_pc);
                         }
                     }
                 }
@@ -1047,6 +1388,13 @@ impl PhaseBEngine {
     /// Returns `None` when the branch is not a loop candidate at all (neither
     /// successor goes backwards) or when its condition cannot be resolved
     /// concretely, in which case the gate list is left untouched.
+    ///
+    /// Only conditional exits are ever seen here: the caller reaches this through
+    /// `BlockExit::cond()`, which is `Some` for a branch and `None` for everything
+    /// else.  A loop that closes with an unconditional jump (a `while` head whose
+    /// tainted test sits in a *forward* branch, then `b top`) therefore never opens
+    /// a gate at all -- a known under-approximation, symmetric in both directions
+    /// (no gate is pushed, and none is left behind to be popped).
     fn branch_loops_back(
         &self,
         block: &Block,
@@ -1060,7 +1408,6 @@ impl PhaseBEngine {
             BlockExit::Branch { target, fallthrough, .. } => {
                 (backward(target), backward(fallthrough))
             }
-            BlockExit::Jump { target } => (backward(target), false),
             _ => return None,
         };
         if !target_back && !fallthrough_back {
@@ -1090,7 +1437,10 @@ impl PhaseBEngine {
     /// Whether `v` is a value that has already been through a mixing chain.
     fn operand_mixed(&self, v: Value) -> bool {
         match v {
-            Value::Var(vn) => !vn.is_invalid() && self.def_mixed.contains(&vn.id),
+            Value::Var(vn) => {
+                !vn.is_invalid()
+                    && (self.def_mixed.contains(&vn.id) || self.mixed_regs.contains(&vn.id))
+            }
             Value::Const(..) => false,
         }
     }
@@ -1108,15 +1458,22 @@ impl PhaseBEngine {
         constant: u64,
         env: &mut dyn ConcreteEnv,
     ) {
+        let (_, var_from_fallback) = self.resolve_taint(var);
+
         if constant != 0 {
             // Direct form, e.g. `x == 0x41`.  A bit test (`value & 1 == 1`) is a
             // mask, not a protocol constant -- but only when the mask *is* the
             // constant being tested for.  A partial mask (`value & 0xF0 == 0xA0`)
             // is a real discriminant: setting the byte to 0xA0 passes the check.
-            if let Value::Var(vn) = var {
-                if self.def_masked.get(&vn.id).map_or(false, |mask| *mask == constant) {
-                    return;
-                }
+            let Value::Var(vn) = var else { return };
+            // Every conditional branch lifts to a comparison against a flag
+            // (`beq` is `ZR == 0x1`), so a flag whose taint came from input says
+            // nothing about what the input should contain.
+            if self.flag_vars.contains(&vn.id) {
+                return;
+            }
+            if self.def_masked.get(&vn.id).map_or(false, |mask| *mask == constant) {
+                return;
             }
             if tag.is_clean() {
                 return;
@@ -1132,9 +1489,8 @@ impl PhaseBEngine {
                 return;
             }
             let sources = self.contexts_of(&tag);
-            if let Some(observer) = self.observer.as_mut() {
-                observer.on_magic_compare(&sources, constant, 0.85);
-            }
+            let confidence = self.magic_confidence(var, constant, 0.85);
+            self.emit_magic(sources, constant, confidence, var_from_fallback);
             return;
         }
 
@@ -1145,9 +1501,15 @@ impl PhaseBEngine {
         // The taint must come from the base side (the input being compared).  This
         // single gate rejects the thousands of flag updates (`counter == 0`,
         // `CY == 0`) without needing any instrumentation-specific blacklist.
-        let base_tag = self.taint_in(info.base);
+        let (base_tag, base_from_fallback) = self.resolve_taint(info.base);
         if base_tag.is_clean() {
             return;
+        }
+        // A flag on the base side is the same branch idiom, one level down.
+        if let Value::Var(base_vn) = info.base {
+            if self.flag_vars.contains(&base_vn.id) {
+                return;
+            }
         }
 
         // A mixed base is a running checksum, so the comparison is its final
@@ -1160,35 +1522,113 @@ impl PhaseBEngine {
             return;
         }
 
-        // If the *other* operand is also tainted the firmware is comparing two
-        // inputs -- an echo or verification, e.g. a received CRC against a
-        // computed one.  Neither side is a value it expects from us, so there is
-        // no discriminant: this is the checksum signal, not a magic constant.
-        let other_tag = self.taint_in(info.other);
-        if !other_tag.is_clean() {
-            let sources = self.contexts_of(&base_tag.union(&other_tag));
-            if let Some(observer) = self.observer.as_mut() {
-                observer.on_checksum(&sources, 0.5);
-            }
-            return;
-        }
-
         // The compared value: the constant operand, or -- for the literal-pool
         // form, where ARM cannot encode the immediate -- whatever the other
         // operand concretely holds.
+        //
+        // The "is the other side also input?" test belongs *inside* the
+        // non-constant arm and nowhere else: for the constant form `info.other`
+        // is the base operand itself (there is no second operand), so testing it
+        // unconditionally would reject every real `cmp r, #imm` -- the single
+        // most valuable shape this rule exists to catch.
         let (value, confidence) = match info.constant {
             Some(c) => (c, 0.85),
-            None => match self.concrete_in(info.other, env) {
-                Some(c) => (c, 0.6),
-                None => return,
-            },
+            None => {
+                // Two inputs compared against each other: an echo or a
+                // verification (a received CRC against a computed one).  Neither
+                // side is a value the firmware expects from us, so there is no
+                // discriminant here -- that is the checksum signal.
+                let other_tag = self.taint_in(info.other);
+                if !other_tag.is_clean() {
+                    let sources = self.contexts_of(&base_tag.union(&other_tag));
+                    if let Some(observer) = self.observer.as_mut() {
+                        observer.on_checksum(&sources, 0.5);
+                    }
+                    return;
+                }
+                match self.concrete_in(info.other, env) {
+                    Some(c) => (c, 0.6),
+                    None => return,
+                }
+            }
         };
-        let value = if info.is_add { value.wrapping_neg() } else { value };
+        // An add-form comparison states its constant in negated form (`cmn r0, #1`
+        // is `r0 + 1 == 0`), so the discriminant is the negation of the constant --
+        // masked back to the width of the operands, or a four-byte `+1` comes out
+        // as 0xffff_ffff_ffff_ffff and reads like a valid 64-bit constant.
+        let width = value_size(info.base).max(value_size(info.other));
+        let value = mask_to_size(value, width);
+        let value = if info.is_add { mask_to_size(value.wrapping_neg(), width) } else { value };
         let sources = self.contexts_of(&base_tag);
+        let confidence = self.magic_confidence(info.base, value, confidence);
+        self.emit_magic(sources, value, confidence, base_from_fallback);
+    }
+
+    /// The confidence a discriminant deserves, after rejecting the values that are
+    /// not discriminants at all.
+    ///
+    /// Two shapes reach this point with a value the input should never take: an
+    /// address (scheduler and allocator code compares pointers, and input taint
+    /// reaches those comparisons through the scheduler -- and such a value is
+    /// stable across seeds, so no cross-seed filter can see it), and a constant the
+    /// compared value is an *offset* of (`c + 1 == 0xe`, where the firmware is
+    /// bounding a derived value).  Both stay in the evidence, at a confidence below
+    /// the mutation threshold.
+    fn magic_confidence(&mut self, var: Value, value: u64, confidence: f32) -> f32 {
+        let offset_base = match var {
+            Value::Var(vn) => self.def_sub.contains_key(&vn.id),
+            _ => false,
+        };
+        if looks_like_address(value) || offset_base {
+            self.demoted_discriminants += 1;
+            return DEMOTED_CONFIDENCE;
+        }
+        confidence
+    }
+
+    /// Hand one magic observation to the observer.
+    fn emit_magic(
+        &mut self,
+        sources: Vec<AccessContext>,
+        value: u64,
+        confidence: f32,
+        from_fallback: bool,
+    ) {
+        let compare_pc = self.cur_pc;
         if let Some(observer) = self.observer.as_mut() {
-            observer.on_magic_compare(&sources, value, confidence);
+            observer.on_magic_compare(
+                &sources,
+                value,
+                confidence,
+                MagicEvidence { compare_pc, from_fallback },
+            );
         }
     }
+}
+
+/// Confidence given to a discriminant that is kept for the audit trail but is
+/// known not to be a value the input should take (see `looks_like_address` and the
+/// offset-base case in `report_compare`): below the mutation side's threshold, so
+/// the evidence survives and the role does not.
+const DEMOTED_CONFIDENCE: f32 = 0.3;
+
+/// Whether a constant is really an address.
+///
+/// Calibrated on the target: the lowest code address is 0x0800_0000, and the range
+/// covers SRAM (0x2000_xxxx), peripherals (0x4000_xxxx) and the NVIC
+/// (0xE000_xxxx).  Pointers are *stable across seeds*, which is exactly why a
+/// cross-seed filter cannot see them, so they are rejected on their shape.
+fn looks_like_address(v: u64) -> bool {
+    v >= 0x0800_0000
+}
+
+/// Whether an operation *creates* a mixing chain out of tainted data.
+///
+/// Bit manipulation (`& mask`, `| bit`, `<< n`) only moves bits around, so it
+/// preserves an existing marker but must not create one; the operations that fold
+/// two values together do create one.
+fn creates_mixing(op: Op) -> bool {
+    matches!(op, Op::IntXor | Op::IntMul | Op::IntRight | Op::IntSignedRight)
 }
 
 fn value_size(v: Value) -> u8 {
@@ -1248,12 +1688,22 @@ pub struct PhaseBCounters {
     pub skipped_space_ops: u64,
     /// Tainted stores that landed in the stack window and produced no role.
     pub stack_stores_skipped: u64,
+    /// Tainted stores that went to a peripheral register instead of memory.
+    pub device_writes: u64,
+    /// Magic discriminants demoted for being addresses, or boundaries of a value
+    /// derived from the input.  Reported so a run can be read without mistaking
+    /// them for protocol constants.
+    pub demoted_discriminants: u64,
     /// Loads whose address was tainted (table lookups).
     pub table_loads: u64,
     /// Groups where interpretation stopped part-way (see `PhaseBEngine`).
     pub early_stops: u64,
     /// Whether a panic forced the pass to disarm.
     pub panic_disarmed: bool,
+    /// Bytes dropped from the shadow memory because it hit its bound.  Non-zero
+    /// means taint was lost silently, so it is worth surfacing rather than hiding
+    /// in a field nobody reads.
+    pub evictions: u64,
 }
 
 fn mask_to_size(v: u64, size: u8) -> u64 {
@@ -1345,7 +1795,7 @@ pub struct PhaseBState {
 impl PhaseBState {
     pub fn reset_pass(
         &mut self,
-        read_sites: HashMap<u64, StreamKey>,
+        read_sites: HashMap<u64, Vec<StreamKey>>,
         mmio_ranges: Vec<Range<u64>>,
     ) {
         self.mmio_ranges = mmio_ranges.clone();
@@ -1498,6 +1948,16 @@ pub fn install(
         state.borrow_mut().engine.set_stack_pointer(sp);
     }
 
+    // Flag registers, resolved from the spec rather than assumed: every
+    // conditional branch lifts to a comparison against one of these (`beq` is
+    // `ZR == 0x1`), so a flag that picked up input taint must not be reported as a
+    // value the input should take.
+    let flags: Vec<VarId> = ["ZR", "CY", "NG", "OV", "tmpZR", "tmpCY", "tmpNG", "tmpOV"]
+        .into_iter()
+        .filter_map(|name| vm.cpu.arch.sleigh.get_varnode(name).map(|vn| vn.id))
+        .collect();
+    state.borrow_mut().engine.set_flag_vars(flags);
+
     // Classify the spec's user ops by name.  Anything unrecognised stays
     // conservative (treated as an opaque call) rather than being guessed at.
     let user_ops: Vec<_> = vm
@@ -1572,7 +2032,7 @@ mod tests {
         loads: Vec<(AccessContext, u8)>,
         stores: Vec<(Vec<AccessContext>, u64, u64, u8, u64)>,
         magics: Vec<(Vec<AccessContext>, u64, f32)>,
-        loop_bounds: Vec<(AccessContext, AccessContext, u64)>,
+        loop_bounds: Vec<(AccessContext, Vec<u32>, AccessContext, u64, u64)>,
         checksums: Vec<(Vec<AccessContext>, f32)>,
         table_loads: usize,
     }
@@ -1607,22 +2067,38 @@ mod tests {
                 .push((sources.to_vec(), pc, addr, size, value));
         }
 
-        fn on_magic_compare(&mut self, sources: &[AccessContext], value: u64, confidence: f32) {
+        fn on_magic_compare(
+            &mut self,
+            sources: &[AccessContext],
+            value: u64,
+            confidence: f32,
+            _evidence: MagicEvidence,
+        ) {
             self.recorded
                 .borrow_mut()
                 .magics
                 .push((sources.to_vec(), value, confidence));
         }
 
-        fn on_loop_bound(&mut self, source: AccessContext, target: AccessContext, count: u64) {
-            self.recorded.borrow_mut().loop_bounds.push((source, target, count));
+        fn on_loop_bound(
+            &mut self,
+            source: AccessContext,
+            source_occs: &[u32],
+            target: AccessContext,
+            count: u64,
+            gated_count: u64,
+        ) {
+            self.recorded
+                .borrow_mut()
+                .loop_bounds
+                .push((source, source_occs.to_vec(), target, count, gated_count));
         }
 
         fn on_checksum(&mut self, sources: &[AccessContext], confidence: f32) {
             self.recorded.borrow_mut().checksums.push((sources.to_vec(), confidence));
         }
 
-        fn on_table_load(&mut self, _addr_sources: &[AccessContext]) {
+        fn on_table_load(&mut self, _addr_sources: &[AccessContext], _pc: u64) {
             self.recorded.borrow_mut().table_loads += 1;
         }
     }
@@ -1681,7 +2157,7 @@ mod tests {
     #[test]
     fn source_load_is_reported_after_the_read_executes() {
         let mut e = engine();
-        e.read_sites.insert(0x100, 0x5800_0000);
+        e.pin_site(0x100, 0x5800_0000);
 
         let mut p = pcode::Block::new();
         p.push(marker(0x100));
@@ -1705,7 +2181,7 @@ mod tests {
     #[test]
     fn tainted_store_reports_provenance_to_observer() {
         let mut e = engine();
-        e.read_sites.insert(0x100, 0x5800_0000);
+        e.pin_site(0x100, 0x5800_0000);
 
         let mut p = pcode::Block::new();
         p.push(marker(0x100));
@@ -1740,7 +2216,7 @@ mod tests {
     #[test]
     fn magic_compare_reports_the_expected_constant() {
         let mut e = engine();
-        e.read_sites.insert(0x100, 0x5800_0000);
+        e.pin_site(0x100, 0x5800_0000);
 
         let mut p = pcode::Block::new();
         p.push(marker(0x100));
@@ -1765,7 +2241,7 @@ mod tests {
     #[test]
     fn magic_compare_handles_constant_on_either_side() {
         let mut e = engine();
-        e.read_sites.insert(0x100, 0x5800_0000);
+        e.pin_site(0x100, 0x5800_0000);
 
         let mut p = pcode::Block::new();
         p.push(marker(0x100));
@@ -1791,7 +2267,7 @@ mod tests {
     #[test]
     fn range_guard_does_not_report_a_magic_constant() {
         let mut e = engine();
-        e.read_sites.insert(0x100, 0x5800_0000);
+        e.pin_site(0x100, 0x5800_0000);
 
         let mut p = pcode::Block::new();
         p.push(marker(0x100));
@@ -1833,8 +2309,8 @@ mod tests {
     #[test]
     fn loop_bound_is_reported_for_looping_gate() {
         let mut e = engine();
-        e.read_sites.insert(0x200, 0x5800_0008);
-        e.read_sites.insert(0x300, 0x5800_0000);
+        e.pin_site(0x200, 0x5800_0008);
+        e.pin_site(0x300, 0x5800_0000);
 
         let mut p1 = pcode::Block::new();
         p1.push(marker(0x200));
@@ -1859,6 +2335,10 @@ mod tests {
         env.regs.insert(9, 0x5800_0008);
         env.regs.insert(8, 0x5800_0000);
         env.regs.insert(3, 0);
+        // The bound register is loaded from the stream, so its concrete value has
+        // to come from there too: without it the branch condition is unresolvable,
+        // `branch_loops_back` declines to act, and no gate is ever established.
+        env.mem.insert(0x5800_0008, 5);
 
         let (observer, recorded) = Recorder::new();
         e.set_observer(Box::new(observer));
@@ -1869,17 +2349,34 @@ mod tests {
         }
         e.emit_observations();
 
-        let source = AccessContext::new(0x200, 0x5800_0008);
-        let target = AccessContext::new(0x300, 0x5800_0000);
-        assert_eq!(recorded.borrow().loop_bounds, vec![(source, target, 3)]);
+        // Both sides are read *sites*: the bound is a relation between sites, and
+        // the occurrences that opened it are reported separately.
+        let source = AccessContext::site(0x200, 0x5800_0008);
+        let target = AccessContext::site(0x300, 0x5800_0000);
+        // Two events, and the first one is expected rather than a bug.
+        //
+        // The length field is re-read inside the loop body, so from round two on
+        // its own reads are bounded by the gate it opened in round one: that is the
+        // same-site approximation this pass relies on for helper-style byte reads
+        // (`bl read_byte` reusing one read site, where the payload is marked
+        // *because* later occurrences are bounded).  The engine cannot tell the two
+        // shapes apart -- both are "a later occurrence of a site is gated by a gate
+        // that site opened" -- so the self-site entry is the observable cost of
+        // keeping helper targets working.  It is reported at the site's own stream,
+        // and the second event is the one the rule is really about.
+        assert_eq!(
+            recorded.borrow().loop_bounds,
+            vec![(source, vec![1], source, 3, 2), (source, vec![1], target, 3, 3)],
+            "the self-site event is the documented same-site approximation"
+        );
     }
 
     /// A gate evaluated only once is a decision, not a length.
     #[test]
     fn single_activation_is_not_a_loop_bound() {
         let mut e = engine();
-        e.read_sites.insert(0x200, 0x5800_0008);
-        e.read_sites.insert(0x300, 0x5800_0000);
+        e.pin_site(0x200, 0x5800_0008);
+        e.pin_site(0x300, 0x5800_0000);
 
         let mut p1 = pcode::Block::new();
         p1.push(marker(0x200));
@@ -1888,7 +2385,9 @@ mod tests {
         p1.push((reg(2), Op::IntEqual, reg(1), Value::Const(3, 4)));
         let exit1 = BlockExit::Branch {
             cond: Value::Var(reg(2)),
-            target: Target::External(Value::Const(0x300, 4)),
+            // A real back-edge, so the gate *is* established: the point of this
+            // test is that a loop taken once is still not a length.
+            target: Target::External(Value::Const(0x200, 4)),
             fallthrough: Target::External(Value::Const(0x400, 4)),
         };
         let b1 = lifter_block(p1, 0x200, 0x208, exit1);
@@ -1901,6 +2400,7 @@ mod tests {
         let mut env = MockEnv::new();
         env.regs.insert(9, 0x5800_0008);
         env.regs.insert(8, 0x5800_0000);
+        env.mem.insert(0x5800_0008, 3);
 
         let (observer, recorded) = Recorder::new();
         e.set_observer(Box::new(observer));
@@ -1908,15 +2408,15 @@ mod tests {
         e.run_block(&b2, &mut env);
         e.emit_observations();
 
-        assert!(recorded.borrow().loop_bounds.is_empty());
+        assert!(recorded.borrow().loop_bounds.is_empty(), "count=1 must not be a length");
     }
 
     /// A loop that reads the target fewer than three times is not a length.
     #[test]
     fn loop_with_two_target_reads_is_not_a_length() {
         let mut e = engine();
-        e.read_sites.insert(0x200, 0x5800_0008);
-        e.read_sites.insert(0x300, 0x5800_0000);
+        e.pin_site(0x200, 0x5800_0008);
+        e.pin_site(0x300, 0x5800_0000);
 
         let mut p1 = pcode::Block::new();
         p1.push(marker(0x200));
@@ -1925,7 +2425,9 @@ mod tests {
         p1.push((reg(2), Op::IntLess, reg(3), reg(1)));
         let exit1 = BlockExit::Branch {
             cond: Value::Var(reg(2)),
-            target: Target::External(Value::Const(0x300, 4)),
+            // A real back-edge: the gate must exist for the assertion to mean
+            // "two reads is not enough", rather than "no gate at all".
+            target: Target::External(Value::Const(0x200, 4)),
             fallthrough: Target::External(Value::Const(0x400, 4)),
         };
         let b1 = lifter_block(p1, 0x200, 0x208, exit1);
@@ -1939,6 +2441,7 @@ mod tests {
         env.regs.insert(9, 0x5800_0008);
         env.regs.insert(8, 0x5800_0000);
         env.regs.insert(3, 0);
+        env.mem.insert(0x5800_0008, 5);
 
         let (observer, recorded) = Recorder::new();
         e.set_observer(Box::new(observer));
@@ -1960,8 +2463,8 @@ mod tests {
     #[test]
     fn forward_branch_is_not_a_loop_bound_even_when_repeated() {
         let mut e = engine();
-        e.read_sites.insert(0x200, 0x5800_0008);
-        e.read_sites.insert(0x300, 0x5800_0000);
+        e.pin_site(0x200, 0x5800_0008);
+        e.pin_site(0x300, 0x5800_0000);
 
         let mut p1 = pcode::Block::new();
         p1.push(marker(0x200));
@@ -1984,6 +2487,9 @@ mod tests {
         let mut env = MockEnv::new();
         env.regs.insert(9, 0x5800_0008);
         env.regs.insert(8, 0x5800_0000);
+        // Resolvable condition, so the branch really is evaluated: the point is
+        // that a forward branch is rejected on its shape, not on ignorance.
+        env.mem.insert(0x5800_0008, 3);
 
         let (observer, recorded) = Recorder::new();
         e.set_observer(Box::new(observer));
@@ -1999,11 +2505,255 @@ mod tests {
         );
     }
 
+    /// The terminator loop (`while (buf[i] != 0)`) is the shape that makes a naive
+    /// gate rule collapse the whole payload into length fields.
+    ///
+    /// Every iteration's byte becomes the next iteration's branch condition, so
+    /// each round would open a fresh gate and be reported as a length field.  The
+    /// admission rule keeps exactly one gate (the byte read before the loop was
+    /// ever bounded), and the exit branch retires it.
+    #[test]
+    fn terminator_loop_opens_one_gate_and_retires_it() {
+        let mut e = engine();
+        e.pin_site(0x200, 0x5800_0000);
+        e.pin_site(0x400, 0x5800_0004);
+
+        // do { r5 = LOAD[DR]; } while (r5 != 0);
+        let mut p = pcode::Block::new();
+        p.push(marker(0x200));
+        p.push((reg(5), Op::Load(0), reg(8)));
+        p.push(marker(0x204));
+        p.push((reg(6), Op::IntNotEqual, reg(5), Value::Const(0, 4)));
+        let exit = BlockExit::Branch {
+            cond: Value::Var(reg(6)),
+            target: Target::External(Value::Const(0x200, 4)),
+            fallthrough: Target::External(Value::Const(0x400, 4)),
+        };
+        let body = lifter_block(p, 0x200, 0x208, exit);
+
+        // The field that follows the loop, read from a different site.
+        let mut p2 = pcode::Block::new();
+        p2.push(marker(0x400));
+        p2.push((reg(7), Op::Load(0), reg(9)));
+        let after = lifter_block(p2, 0x400, 0x408, BlockExit::invalid());
+
+        let mut env = MockEnv::new();
+        env.regs.insert(8, 0x5800_0000);
+        env.regs.insert(9, 0x5800_0004);
+
+        let (observer, recorded) = Recorder::new();
+        e.set_observer(Box::new(observer));
+
+        // Three iterations; the third byte terminates the string.
+        env.mem.insert(0x5800_0000, 5);
+        e.run_block(&body, &mut env);
+        e.run_block(&body, &mut env);
+        env.mem.insert(0x5800_0000, 0);
+        e.run_block(&body, &mut env);
+        // The field after the loop must not be swept into the retired bound.
+        e.run_block(&after, &mut env);
+        e.emit_observations();
+
+        // `byte` names a *site* (the bound's two sides are sites); `following` is
+        // an occurrence, because that is what the bounded-read set stores.
+        let byte = AccessContext::site(0x200, 0x5800_0000);
+        let following = AccessContext::new(0x400, 0x5800_0004);
+        assert_eq!(
+            recorded.borrow().loop_bounds,
+            vec![(byte, vec![1], byte, 3, 2)],
+            "exactly one gate: 3 reads total, 2 of them after the gate existed"
+        );
+        assert!(e.gating.is_empty(), "the exit branch must retire the gate");
+        assert!(
+            !e.bounded_read_set.contains(&following),
+            "a field read after the loop is not inside any bound"
+        );
+        assert!(
+            e.ctrl_obs.values().all(|obs| !obs.bounded_reads.contains(&following)),
+            "the following field must not appear in any bounded span"
+        );
+    }
+
+    /// Two loops driven by the *same* length field keep independent gates.
+    ///
+    /// This is the whole reason the gate key carries the branch pc: if retiring a
+    /// gate matched only on the source context, exiting the second loop would also
+    /// retire the first one, and that loop would silently stop bounding its reads
+    /// (its payload would revert to `Propagated`).
+    #[test]
+    fn two_loops_sharing_one_length_keep_separate_gates() {
+        let mut e = engine();
+        e.pin_site(0x100, 0x5800_0008);
+        e.pin_site(0x200, 0x5800_0000);
+        e.pin_site(0x300, 0x5800_000c);
+
+        // The length field, read once and shared by both loops.
+        let mut p0 = pcode::Block::new();
+        p0.push(marker(0x100));
+        p0.push((reg(1), Op::Load(0), reg(10)));
+        let length = lifter_block(p0, 0x100, 0x108, BlockExit::invalid());
+
+        // Loop 1 (branch at 0x204): reads one stream.
+        let mut p1 = pcode::Block::new();
+        p1.push(marker(0x200));
+        p1.push((reg(5), Op::Load(0), reg(8)));
+        p1.push(marker(0x204));
+        p1.push((reg(2), Op::IntLess, reg(3), reg(1)));
+        let loop1 = lifter_block(
+            p1,
+            0x200,
+            0x208,
+            BlockExit::Branch {
+                cond: Value::Var(reg(2)),
+                target: Target::External(Value::Const(0x200, 4)),
+                fallthrough: Target::External(Value::Const(0x300, 4)),
+            },
+        );
+
+        // Loop 2 (branch at 0x304): reads a different stream, same length field.
+        let mut p2 = pcode::Block::new();
+        p2.push(marker(0x300));
+        p2.push((reg(6), Op::Load(0), reg(9)));
+        p2.push(marker(0x304));
+        p2.push((reg(2), Op::IntLess, reg(3), reg(1)));
+        let loop2 = lifter_block(
+            p2,
+            0x300,
+            0x308,
+            BlockExit::Branch {
+                cond: Value::Var(reg(2)),
+                target: Target::External(Value::Const(0x300, 4)),
+                fallthrough: Target::External(Value::Const(0x400, 4)),
+            },
+        );
+
+        let mut env = MockEnv::new();
+        env.regs.insert(10, 0x5800_0008);
+        env.regs.insert(8, 0x5800_0000);
+        env.regs.insert(9, 0x5800_000c);
+        // The length register's concrete value: both branches compare counter < 5.
+        env.regs.insert(1, 5);
+        env.regs.insert(3, 0);
+
+        let (observer, _recorded) = Recorder::new();
+        e.set_observer(Box::new(observer));
+
+        e.run_block(&length, &mut env);
+        e.run_block(&loop1, &mut env); // loop 1's gate opens
+        e.run_block(&loop2, &mut env); // loop 2's gate opens alongside it
+        assert_eq!(e.gating.len(), 2, "both loops hold a gate");
+
+        // Loop 2 exits: only its own gate may be retired.
+        env.regs.insert(3, 5);
+        e.run_block(&loop2, &mut env);
+        assert!(
+            e.gating.iter().any(|(_, pc)| *pc == 0x204),
+            "retiring loop 2 must not retire loop 1's gate"
+        );
+        assert!(
+            !e.gating.iter().any(|(_, pc)| *pc == 0x304),
+            "loop 2's own gate must be retired"
+        );
+
+        // Loop 1 keeps running, so its reads must still be bounded.
+        env.regs.insert(3, 0);
+        e.run_block(&loop1, &mut env);
+        e.emit_observations();
+
+        let source = AccessContext::site(0x100, 0x5800_0008);
+        let target1 = AccessContext::site(0x200, 0x5800_0000);
+        let bounded = e
+            .ctrl_obs
+            .get(&(source, target1))
+            .map(|obs| obs.bounded_reads.clone())
+            .unwrap_or_default();
+        assert!(
+            bounded.contains(&AccessContext::at(0x200, 0x5800_0000, 2)),
+            "loop 1's read after loop 2 exited must still be bounded, got {bounded:?}"
+        );
+    }
+
+    /// Two gates live at once on one source *site* are still one bound.
+    ///
+    /// This is the shape the dump showed: the `occ2` rows reported a
+    /// `gated_count` of exactly twice `count` (274 against 140), because two back
+    /// edges -- an inner and an outer loop, at different pcs -- both derive their
+    /// condition from the same read, so both gates were live and every target read
+    /// was appended to the same observation once per gate.  The gate key carries
+    /// the branch pc, which is what lets the two be retired independently, so the
+    /// deduplication has to happen where the read is recorded: a read is credited
+    /// to a bound once, however many live gates state it.  That is also what makes
+    /// `gated_count <= count` structural rather than a hope.
+    #[test]
+    fn two_gates_on_one_source_share_one_bound() {
+        let mut e = engine();
+        e.pin_site(0x100, 0x5800_0008);
+        e.pin_site(0x200, 0x5800_0000);
+
+        // The shared source: read once, gating both loops.
+        let mut p0 = pcode::Block::new();
+        p0.push(marker(0x100));
+        p0.push((reg(1), Op::Load(0), reg(10)));
+        let length = lifter_block(p0, 0x100, 0x108, BlockExit::invalid());
+
+        // The bounded site: read once per round.
+        let mut p1 = pcode::Block::new();
+        p1.push(marker(0x200));
+        p1.push((reg(5), Op::Load(0), reg(8)));
+        let target = lifter_block(p1, 0x200, 0x208, BlockExit::invalid());
+
+        // Two back edges at different pcs, both conditioned on the same value.
+        fn back_edge(pc: u64, fallthrough: u64) -> Block {
+            let mut p = pcode::Block::new();
+            p.push(marker(pc));
+            p.push((reg(2), Op::IntLess, reg(3), reg(1)));
+            lifter_block(
+                p,
+                pc,
+                pc + 8,
+                BlockExit::Branch {
+                    cond: Value::Var(reg(2)),
+                    target: Target::External(Value::Const(pc, 4)),
+                    fallthrough: Target::External(Value::Const(fallthrough, 4)),
+                },
+            )
+        }
+        let inner = back_edge(0x300, 0x400);
+        let outer = back_edge(0x400, 0x500);
+
+        let mut env = MockEnv::new();
+        env.regs.insert(10, 0x5800_0008);
+        env.regs.insert(8, 0x5800_0000);
+        env.regs.insert(3, 0);
+        // Concrete `0 < 5`, so both back edges are taken and both gates open.
+        env.regs.insert(1, 5);
+        env.mem.insert(0x5800_0008, 5);
+
+        let (observer, recorded) = Recorder::new();
+        e.set_observer(Box::new(observer));
+
+        e.run_block(&length, &mut env);
+        for _ in 0..3 {
+            e.run_block(&target, &mut env);
+            e.run_block(&inner, &mut env);
+            e.run_block(&outer, &mut env);
+        }
+        e.emit_observations();
+
+        let source = AccessContext::site(0x100, 0x5800_0008);
+        let bounded = AccessContext::site(0x200, 0x5800_0000);
+        assert_eq!(
+            recorded.borrow().loop_bounds,
+            vec![(source, vec![1], bounded, 3, 2)],
+            "one bound for the source site: 3 reads, 2 of them with both gates live"
+        );
+    }
+
     /// A tainted store inside the stack window is a spill, not a consumption.
     #[test]
     fn stack_spill_is_not_reported_as_a_sink() {
         let mut e = engine();
-        e.read_sites.insert(0x100, 0x5800_0000);
+        e.pin_site(0x100, 0x5800_0000);
         e.set_stack_pointer(VarNode::new(13, 4));
         e.stack_window = 0x100;
 
@@ -2034,7 +2784,7 @@ mod tests {
     #[test]
     fn prologue_store_above_sp_is_a_spill() {
         let mut e = engine();
-        e.read_sites.insert(0x100, 0x5800_0000);
+        e.pin_site(0x100, 0x5800_0000);
         e.set_stack_pointer(VarNode::new(13, 4));
         e.stack_window = 0x100;
         e.stack_window_up = 0x40;
@@ -2065,8 +2815,8 @@ mod tests {
     #[test]
     fn echo_comparison_is_checksum_not_magic() {
         let mut e = engine();
-        e.read_sites.insert(0x100, 0x5800_0000);
-        e.read_sites.insert(0x104, 0x5800_0004);
+        e.pin_site(0x100, 0x5800_0000);
+        e.pin_site(0x104, 0x5800_0004);
 
         let mut p = pcode::Block::new();
         p.push(marker(0x100));
@@ -2096,8 +2846,8 @@ mod tests {
     #[test]
     fn var_vs_var_equality_is_checksum() {
         let mut e = engine();
-        e.read_sites.insert(0x100, 0x5800_0000);
-        e.read_sites.insert(0x104, 0x5800_0004);
+        e.pin_site(0x100, 0x5800_0000);
+        e.pin_site(0x104, 0x5800_0004);
 
         let mut p = pcode::Block::new();
         p.push(marker(0x100));
@@ -2126,7 +2876,7 @@ mod tests {
     #[test]
     fn hardcoded_checksum_comparison_is_not_magic() {
         let mut e = engine();
-        e.read_sites.insert(0x100, 0x5800_0000);
+        e.pin_site(0x100, 0x5800_0000);
 
         let mut p = pcode::Block::new();
         p.push(marker(0x100));
@@ -2154,7 +2904,7 @@ mod tests {
     #[test]
     fn partial_mask_comparison_is_magic() {
         let mut e = engine();
-        e.read_sites.insert(0x100, 0x5800_0000);
+        e.pin_site(0x100, 0x5800_0000);
 
         let mut p = pcode::Block::new();
         p.push(marker(0x100));
@@ -2175,14 +2925,231 @@ mod tests {
         assert_eq!(recorded.magics[0].1, 0xa0);
     }
 
+    /// The other side of the mask rule: masking a *checksum* does not turn it into
+    /// a protocol constant.  `tmp = crc & 0xFFFF; tmp == 0x4321` is the final check
+    /// of a checksum, and labelling those bytes magic would hand the mutator a
+    /// constant it cannot successfully rewrite.
+    #[test]
+    fn masked_checksum_comparison_is_checksum() {
+        let mut e = engine();
+        e.pin_site(0x100, 0x5800_0000);
+
+        let mut p = pcode::Block::new();
+        p.push(marker(0x100));
+        p.push((reg(1), Op::Load(0), reg(5)));
+        p.push((reg(2), Op::IntXor, reg(2), reg(1)));            // crc accumulates
+        p.push((reg(3), Op::IntAnd, reg(2), Value::Const(0xffff, 4)));
+        p.push((reg(4), Op::IntEqual, reg(3), Value::Const(0x4321, 4)));
+        let block = lifter_block(p, 0x100, 0x110, BlockExit::invalid());
+
+        let mut env = MockEnv::new();
+        env.regs.insert(5, 0x5800_0000);
+        env.regs.insert(2, 0);
+
+        let (observer, recorded) = Recorder::new();
+        e.set_observer(Box::new(observer));
+        e.run_block(&block, &mut env);
+
+        let recorded = recorded.borrow();
+        assert!(
+            recorded.magics.is_empty(),
+            "masking a checksum does not make it a protocol constant"
+        );
+        assert_eq!(recorded.checksums.len(), 1);
+    }
+
+    /// Guard for the constant form: `cmp r, #imm` lifts to a subtraction whose
+    /// "other" operand *is* the base, so the input-vs-input test must not be
+    /// applied to it.  If it were, every real magic comparison would be
+    /// downgraded to checksum and magic detection would silently vanish.
+    #[test]
+    fn constant_form_comparison_stays_magic() {
+        let mut e = engine();
+        e.pin_site(0x100, 0x5800_0000);
+
+        let mut p = pcode::Block::new();
+        p.push(marker(0x100));
+        p.push((reg(1), Op::Load(0), reg(5)));
+        p.push((reg(2), Op::IntSub, reg(1), Value::Const(0xaa, 4)));
+        p.push((reg(3), Op::IntEqual, reg(2), Value::Const(0, 4)));
+        let block = lifter_block(p, 0x100, 0x110, BlockExit::invalid());
+
+        let mut env = MockEnv::new();
+        env.regs.insert(5, 0x5800_0000);
+
+        let (observer, recorded) = Recorder::new();
+        e.set_observer(Box::new(observer));
+        e.run_block(&block, &mut env);
+
+        let recorded = recorded.borrow();
+        let source = AccessContext::new(0x100, 0x5800_0000);
+        assert_eq!(recorded.magics, vec![(vec![source], 0xaa, 0.85)]);
+        assert!(recorded.checksums.is_empty(), "a constant comparison is not a checksum");
+    }
+
+    /// A checksum accumulated inside a loop is compared after the loop exits, in a
+    /// different group.  The "this value is mixed" marker has to survive that
+    /// boundary, or the final comparison is misread as a magic constant.
+    #[test]
+    fn cross_block_checksum_comparison_is_not_magic() {
+        let mut e = engine();
+        e.pin_site(0x100, 0x5800_0000);
+
+        // Group 1: the loop body mixes into a register accumulator.
+        let mut p1 = pcode::Block::new();
+        p1.push(marker(0x100));
+        p1.push((reg(1), Op::Load(0), reg(5)));
+        p1.push((reg(2), Op::IntXor, reg(2), reg(1)));
+        let b1 = lifter_block(p1, 0x100, 0x108, BlockExit::invalid());
+
+        // Group 2: after the loop, compare the accumulator against a constant.
+        let mut p2 = pcode::Block::new();
+        p2.push(marker(0x200));
+        p2.push((reg(3), Op::IntSub, reg(2), Value::Const(0x1234, 4)));
+        p2.push((reg(4), Op::IntEqual, reg(3), Value::Const(0, 4)));
+        let b2 = lifter_block(p2, 0x200, 0x208, BlockExit::invalid());
+
+        let mut env = MockEnv::new();
+        env.regs.insert(5, 0x5800_0000);
+        env.regs.insert(2, 0);
+
+        let (observer, recorded) = Recorder::new();
+        e.set_observer(Box::new(observer));
+        e.run_block(&b1, &mut env);
+        e.run_block(&b2, &mut env);
+
+        let recorded = recorded.borrow();
+        assert!(
+            recorded.magics.is_empty(),
+            "a cross-block checksum comparison must not become magic"
+        );
+        assert_eq!(recorded.checksums.len(), 1);
+    }
+
+    /// The mirror image of the test above: a register that once held a checksum is
+    /// *not* still a checksum after being reloaded with fresh input.
+    ///
+    /// Registers are reused constantly at -O2, and a CRC accumulator and a
+    /// separator comparison often share the same low register number; a marker
+    /// that never expires would silently delete magic evidence for every later
+    /// comparison on that register.
+    #[test]
+    fn register_reuse_clears_mixed() {
+        let mut e = engine();
+        e.pin_site(0x100, 0x5800_0000);
+        e.pin_site(0x200, 0x5800_0004);
+
+        // Block 1: r2 accumulates a checksum.
+        let mut p1 = pcode::Block::new();
+        p1.push(marker(0x100));
+        p1.push((reg(1), Op::Load(0), reg(5)));
+        p1.push((reg(2), Op::IntXor, reg(2), reg(1)));
+        let b1 = lifter_block(p1, 0x100, 0x108, BlockExit::invalid());
+
+        // Block 2: the same register is reloaded with fresh input.
+        let mut p2 = pcode::Block::new();
+        p2.push(marker(0x200));
+        p2.push((reg(2), Op::Load(0), reg(7)));
+        let b2 = lifter_block(p2, 0x200, 0x208, BlockExit::invalid());
+
+        // Block 3: compare it against the '\r' separator.
+        let mut p3 = pcode::Block::new();
+        p3.push(marker(0x300));
+        p3.push((reg(3), Op::IntSub, reg(2), Value::Const(0x0d, 4)));
+        p3.push((reg(4), Op::IntEqual, reg(3), Value::Const(0, 4)));
+        let b3 = lifter_block(p3, 0x300, 0x308, BlockExit::invalid());
+
+        let mut env = MockEnv::new();
+        env.regs.insert(5, 0x5800_0000);
+        env.regs.insert(7, 0x5800_0004);
+        env.regs.insert(2, 0);
+
+        let (observer, recorded) = Recorder::new();
+        e.set_observer(Box::new(observer));
+        e.run_block(&b1, &mut env);
+        e.run_block(&b2, &mut env);
+        e.run_block(&b3, &mut env);
+
+        let recorded = recorded.borrow();
+        let fresh = AccessContext::new(0x200, 0x5800_0004);
+        assert_eq!(
+            recorded.magics,
+            vec![(vec![fresh], 0x0d, 0.85)],
+            "a reloaded register is fresh input, not a checksum"
+        );
+        assert!(recorded.checksums.is_empty());
+    }
+
+    /// `count` is the number of reads of the target site over the whole pass, not
+    /// the number that happened while the gate was in effect.
+    ///
+    /// In a bottom-tested loop (`body; subs; bne top`) the first read precedes the
+    /// branch that establishes the gate, so the gated count is one lower than the
+    /// length field's value.  Reporting the gated count would make the
+    /// value-equals-count check fail systematically on exactly the loop shape the
+    /// dump shows.
+    #[test]
+    fn loop_bound_count_is_the_site_total() {
+        let mut e = engine();
+        e.pin_site(0x100, 0x5800_0008);
+        e.pin_site(0x200, 0x5800_0000);
+
+        // The length field is read once, before the loop.
+        let mut p0 = pcode::Block::new();
+        p0.push(marker(0x100));
+        p0.push((reg(1), Op::Load(0), reg(9)));
+        let b0 = lifter_block(p0, 0x100, 0x108, BlockExit::invalid());
+
+        let mut p1 = pcode::Block::new();
+        p1.push(marker(0x200));
+        p1.push((reg(5), Op::Load(0), reg(8)));
+        let b1 = lifter_block(p1, 0x200, 0x208, BlockExit::invalid());
+
+        let mut p2 = pcode::Block::new();
+        p2.push(marker(0x300));
+        p2.push((reg(2), Op::IntLess, reg(3), reg(1)));
+        let exit2 = BlockExit::Branch {
+            cond: Value::Var(reg(2)),
+            target: Target::External(Value::Const(0x200, 4)),
+            fallthrough: Target::External(Value::Const(0x400, 4)),
+        };
+        let b2 = lifter_block(p2, 0x300, 0x308, exit2);
+
+        let mut env = MockEnv::new();
+        env.regs.insert(9, 0x5800_0008);
+        env.regs.insert(8, 0x5800_0000);
+        // Concrete inputs for the branch: counter 0 < length 5 keeps the loop
+        // going, so the gate is established from the first branch onwards.
+        env.regs.insert(3, 0);
+        env.regs.insert(1, 5);
+
+        let (observer, recorded) = Recorder::new();
+        e.set_observer(Box::new(observer));
+
+        e.run_block(&b0, &mut env);
+        for _ in 0..3 {
+            e.run_block(&b1, &mut env);
+            e.run_block(&b2, &mut env);
+        }
+        e.emit_observations();
+
+        let source = AccessContext::site(0x100, 0x5800_0008);
+        let target = AccessContext::site(0x200, 0x5800_0000);
+        assert_eq!(
+            recorded.borrow().loop_bounds,
+            vec![(source, vec![1], target, 3, 2)],
+            "count is the site total (3); only 2 reads happened after the gate existed"
+        );
+    }
+
     /// Once the loop exits, the gate must stop bounding reads: otherwise every
     /// later read of every stream is labelled payload.
     #[test]
     fn loop_exit_ends_the_bound() {
         let mut e = engine();
-        e.read_sites.insert(0x200, 0x5800_0008);
-        e.read_sites.insert(0x300, 0x5800_0000);
-        e.read_sites.insert(0x400, 0x5800_000c);
+        e.pin_site(0x200, 0x5800_0008);
+        e.pin_site(0x300, 0x5800_0000);
+        e.pin_site(0x400, 0x5800_000c);
 
         let mut p1 = pcode::Block::new();
         p1.push(marker(0x200));
@@ -2209,6 +3176,7 @@ mod tests {
         env.regs.insert(9, 0x5800_0008);
         env.regs.insert(8, 0x5800_0000);
         env.regs.insert(10, 0x5800_000c);
+        env.mem.insert(0x5800_0008, 5);
 
         let (observer, recorded) = Recorder::new();
         e.set_observer(Box::new(observer));
@@ -2224,9 +3192,10 @@ mod tests {
         e.run_block(&b3, &mut env);
         e.emit_observations();
 
-        let source = AccessContext::new(0x200, 0x5800_0008);
-        let bounded = AccessContext::new(0x300, 0x5800_0000);
-        let after = AccessContext::new(0x400, 0x5800_000c);
+        // The observation is keyed by sites, so the probe keys are sites too.
+        let source = AccessContext::site(0x200, 0x5800_0008);
+        let bounded = AccessContext::site(0x300, 0x5800_0000);
+        let after = AccessContext::site(0x400, 0x5800_000c);
         let observations = &e.ctrl_obs;
         assert_eq!(
             observations.get(&(source, bounded)).map(|obs| obs.bounded_reads.len()),
@@ -2268,7 +3237,7 @@ mod tests {
     #[test]
     fn call_kills_argument_register_taint() {
         let mut e = engine();
-        e.read_sites.insert(0x100, 0x5800_0000);
+        e.pin_site(0x100, 0x5800_0000);
 
         let mut p = pcode::Block::new();
         p.push(marker(0x100));
@@ -2331,8 +3300,8 @@ mod tests {
     #[test]
     fn group_replay_observes_taken_internal_subblock() {
         let mut e = engine();
-        e.read_sites.insert(0x100, 0x5800_0000);
-        e.read_sites.insert(0x104, 0x5800_0004);
+        e.pin_site(0x100, 0x5800_0000);
+        e.pin_site(0x104, 0x5800_0004);
 
         let (blocks, mut env) = it_block_group(5);
         e.run_group(&blocks, 0, &mut env);
@@ -2344,8 +3313,8 @@ mod tests {
     #[test]
     fn group_replay_skips_untaken_internal_subblock() {
         let mut e = engine();
-        e.read_sites.insert(0x100, 0x5800_0000);
-        e.read_sites.insert(0x104, 0x5800_0004);
+        e.pin_site(0x100, 0x5800_0000);
+        e.pin_site(0x104, 0x5800_0004);
 
         let (blocks, mut env) = it_block_group(7);
         e.run_group(&blocks, 0, &mut env);
@@ -2368,7 +3337,7 @@ mod tests {
     #[test]
     fn instrumentation_cannot_touch_guest_taint() {
         let mut e = engine();
-        e.read_sites.insert(0x100, 0x5800_0000);
+        e.pin_site(0x100, 0x5800_0000);
 
         // Pre-existing taint at guest address 0: the address the coverage
         // bitmap write would collide with if spaces were not distinguished.
@@ -2424,7 +3393,7 @@ mod tests {
     #[test]
     fn real_cmp_shape_yields_the_compared_constant() {
         let mut e = engine();
-        e.read_sites.insert(0x100, 0x5800_0000);
+        e.pin_site(0x100, 0x5800_0000);
 
         let mut p = pcode::Block::new();
         p.push(marker(0x100));
@@ -2478,7 +3447,7 @@ mod tests {
     #[test]
     fn bit_test_is_not_a_magic_value() {
         let mut e = engine();
-        e.read_sites.insert(0x100, 0x5800_0000);
+        e.pin_site(0x100, 0x5800_0000);
 
         let mut p = pcode::Block::new();
         p.push(marker(0x100));
@@ -2502,7 +3471,7 @@ mod tests {
     #[test]
     fn tainted_table_index_propagates_through_the_load() {
         let mut e = engine();
-        e.read_sites.insert(0x100, 0x5800_0000);
+        e.pin_site(0x100, 0x5800_0000);
 
         let mut p = pcode::Block::new();
         p.push(marker(0x100));
@@ -2532,7 +3501,7 @@ mod tests {
     #[test]
     fn mixed_store_is_checksum_not_payload() {
         let mut e = engine();
-        e.read_sites.insert(0x100, 0x5800_0000);
+        e.pin_site(0x100, 0x5800_0000);
 
         let mut p = pcode::Block::new();
         p.push(marker(0x100));

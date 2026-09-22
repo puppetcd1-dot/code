@@ -229,7 +229,7 @@ fn replay_trace(mut vm: Vm, mut target: CortexmMultiStream) -> anyhow::Result<()
     let path_tracer = trace::add_path_tracer(&mut vm, target.mmio_handler.unwrap(), listeners)?;
 
     let mmio_ranges = taint_mmio_ranges()?;
-    let collector = crate::semantic_taint::RoleCollector::new(
+    let mut collector = crate::semantic_taint::RoleCollector::new(
         ledger.clone(),
         crate::semantic_taint::SinkClassifier::from_env(),
     );
@@ -269,32 +269,47 @@ fn replay_trace(mut vm: Vm, mut target: CortexmMultiStream) -> anyhow::Result<()
     let snapshot = vm.snapshot();
     let cursors = target.get_mmio_handler(&mut vm).unwrap().source.snapshot_cursors();
 
-    let mut read_sites: HashMap<u64, crate::input::StreamKey> = HashMap::new();
+    let mut read_sites: HashMap<u64, Vec<crate::input::StreamKey>> = HashMap::new();
     if semantics_enabled {
         if let Some(state) = &phase_b {
             state.borrow_mut().set_armed(false);
         }
+        ledger.clear();
         if let Err(error) = target.run(&mut vm) {
             eprintln!("[taint] discovery pass failed: {error:#}");
         }
         read_sites = ledger.read_sites();
+        // A PC that read more than one stream is not a problem: the analysis keys
+        // every binding by `(pc, stream)`, so each pair becomes its own pseudo-site
+        // with its own read sequence.  It is worth naming anyway -- a shared
+        // `read_byte()` helper and a register sweep over a bank of ports look
+        // alike here and only the roles tell them apart.
+        let multiplexed = ledger.multiplexed_read_sites();
+        if !multiplexed.is_empty() {
+            eprintln!(
+                "[taint] {} read site(s) serve more than one stream; each (pc, stream) is \
+                 analysed as its own pseudo-site: {multiplexed:x?}",
+                multiplexed.len()
+            );
+        }
         eprintln!(
-            "[taint] discovery pass: {} reads across {} sites",
+            "[taint] discovery pass: {} reads across {} site(s) in {} pc(s)",
             ledger.len(),
+            read_sites.values().map(|streams| streams.len()).sum::<usize>(),
             read_sites.len()
         );
 
         vm.restore(&snapshot);
         target.get_mmio_handler(&mut vm).unwrap().source.restore_cursors(&cursors);
-        ledger.clear();
-        collector.reset_pass();
+        // The path tracer is *not* part of the VM snapshot (only the fuzzer's own
+        // Snapshot captures it), so the discovery pass's blocks would otherwise
+        // survive into the analysis pass: the trace would mix two executions, and
+        // the debug builds' `icount >= prev` assertion inside the hook -- which is
+        // not covered by the taint pass's panic guard -- would abort the process.
+        path_tracer.clear(&mut vm);
     }
 
-    if let Some(state) = &phase_b {
-        let mut state = state.borrow_mut();
-        state.reset_pass(read_sites, mmio_ranges.clone());
-        state.set_armed(true);
-    }
+    begin_analysis_pass(&phase_b, &ledger, &mut collector, read_sites, &mmio_ranges);
     passes += 1;
 
     let exit = target.run(&mut vm)?;
@@ -349,11 +364,46 @@ fn replay_trace(mut vm: Vm, mut target: CortexmMultiStream) -> anyhow::Result<()
         let occ_mismatches =
             (counters.loads_interpreted as i64 - collector.loads_observed() as i64).abs();
         let unconsumed = ledger.pending();
+        // Fingerprint of an unmodelled checksum: one magic comparison whose
+        // provenance spans many read sites.
+        let magic_max_width = output.magic_sites.iter().map(|site| site.width).max().unwrap_or(0);
+        // How to read these counters (the directions are not interchangeable):
+        //   * the register-reuse fix moves magic up and checksum down (recalling a
+        //     separator constant that a stale accumulator marker had suppressed);
+        //   * the masked-checksum fix moves magic down and checksum up (a masked
+        //     CRC comparison was being reported as a protocol constant);
+        //   * together the aggregate direction depends on the target's mix of the
+        //     two shapes, so neither counter validates either fix on its own --
+        //     read individual entries instead (small separator-sized constants vs
+        //     masked comparisons);
+        //   * context-level gating raises `bounded_reads` (same-stream bounds used
+        //     to be skipped entirely) while the terminator admission rule makes
+        //     `loop_bounds` drop sharply (one per loop instead of one per byte);
+        //   * the site-keyed gate fix removes double counting: two gates live at
+        //     once on one source used to credit every read twice, which is how a
+        //     row could report `gated_count = 274` against `count = 140`.  Now
+        //     `loop_bounds` has one row per (source, target) site pair and
+        //     `bounded_reads` one mark per read, so both fall to their true values
+        //     and every row satisfies `gated <= count` (asserted in
+        //     `emit_observations`).  Falling here is the fix working, not recall
+        //     lost: compare the per-row `gated` values, not the totals alone.
+        //   * `skipped_space` is zero *by construction* in replay: the coverage
+        //     bitmap that lives in the extra memory spaces is only installed by the
+        //     fuzzing loop's injector, so replay has no non-guest access to skip.
+        //     It is not a health signal here.
+        //   * `width_mismatch` compares the MMIO model's byte count with the width
+        //     of the p-code load.  The model hands over only the bytes whose bits
+        //     the firmware uses, so a 32-bit `ldr` that tests one bit is served
+        //     from a single byte and counts as a mismatch: a unit difference, not
+        //     an alignment error.
+        //   * `unconsumed` is split into reads at dropped ambiguous sites (expected)
+        //     and leftovers from an early stop (the actual drift signal).
         eprintln!(
             "[taint] reads={} sites={} fragments={} roles={} blocks={} stores={} \
              magic={} loop_bounds={} checksum={} table_loads={} bounded_reads={} \
              skipped_space={} stack_skipped={} unbound={} width_mismatch={} occ_mismatch={} \
-             early_stops={} unconsumed={} panic_disarmed={}",
+             early_stops={} unconsumed={} dropped_sites={} leftovers={} demoted={} \
+             panic_disarmed={} magic_max_width={}",
             output.report.mmio_reads,
             output.report.read_sites,
             output.report.source_fragments,
@@ -372,23 +422,41 @@ fn replay_trace(mut vm: Vm, mut target: CortexmMultiStream) -> anyhow::Result<()
             occ_mismatches,
             counters.early_stops,
             unconsumed,
-            counters.panic_disarmed
+            output.report.dropped_site_reads,
+            output.report.early_stop_leftovers,
+            counters.demoted_discriminants,
+            counters.panic_disarmed,
+            magic_max_width
         );
         // `occ_mismatch == 0` on its own proves nothing: both counters advance
-        // together even when the two sides are shifted.  A non-zero `unconsumed`
-        // together with a non-zero `early_stops` is the actual misalignment signal,
-        // because an early stop leaves reads in the queue that the interpreter
-        // never claimed.
-        if unconsumed > 0 && counters.early_stops > 0 {
+        // together even when the two sides are shifted.  Reads the interpreter
+        // never claimed that do *not* belong to a dropped site are the actual
+        // misalignment signal, because an early stop leaves them in the queue.
+        if output.report.early_stop_leftovers > 0 {
             eprintln!(
-                "[taint] WARNING: interpretation stopped early {} time(s) and {unconsumed} \
-                 read(s) were never bound; fragment offsets for those sites may be shifted",
-                counters.early_stops
+                "[taint] WARNING: interpretation stopped early {} time(s) and {} read(s) that \
+                 belong to no dropped site were never bound; fragment offsets for those sites \
+                 may be shifted",
+                counters.early_stops, output.report.early_stop_leftovers
+            );
+        }
+        if output.report.dropped_site_reads > 0 {
+            eprintln!(
+                "[taint] note: {} read(s) belong to read sites that served more than one stream \
+                 and were dropped; those bytes are consumed by nothing, which is expected",
+                output.report.dropped_site_reads
             );
         }
         if counters.panic_disarmed {
             eprintln!(
                 "[taint] WARNING: the taint hook panicked and disarmed; the result is partial"
+            );
+        }
+        if counters.evictions > 0 {
+            eprintln!(
+                "[taint] WARNING: {} byte(s) were evicted from shadow memory (taint lost); \
+                 raise TAINT_MEM_* or narrow the analysis window",
+                counters.evictions
             );
         }
     }
@@ -399,21 +467,50 @@ fn replay_trace(mut vm: Vm, mut target: CortexmMultiStream) -> anyhow::Result<()
     Ok(())
 }
 
+/// Start one analysis pass cleanly.
+///
+/// Clearing the ledger, resetting the collector and re-arming the engine have to
+/// happen together: a pass that starts with reads still queued from the previous
+/// one attributes fragments to the wrong offsets, and no counter would catch it
+/// (both sides keep counting consistently, just about the wrong bytes).  Keeping
+/// the three steps in one place makes it a property of the code rather than a
+/// convention the next driver has to remember.
+fn begin_analysis_pass(
+    phase_b: &Option<std::rc::Rc<std::cell::RefCell<crate::phase_b::PhaseBState>>>,
+    ledger: &crate::semantic_taint::ReadLedger,
+    collector: &mut crate::semantic_taint::RoleCollector,
+    read_sites: HashMap<u64, Vec<crate::input::StreamKey>>,
+    mmio_ranges: &[std::ops::Range<u64>],
+) {
+    ledger.clear();
+    collector.reset_pass();
+    collector.set_read_sites(read_sites.clone());
+    if let Some(state) = phase_b {
+        let mut state = state.borrow_mut();
+        state.reset_pass(read_sites, mmio_ranges.to_vec());
+        state.set_armed(true);
+    }
+}
+
 /// Peripheral address ranges, used both to reject MMIO as taint-addressable
 /// memory and to recognise absolute-addressed peripheral loads.
 fn taint_mmio_ranges() -> anyhow::Result<Vec<std::ops::Range<u64>>> {
     let start = parse_u64_with_prefix(
         &std::env::var("TAINT_MMIO_START").unwrap_or_else(|_| "0x40000000".to_string()),
-    )?;
+    )
+    .ok_or_else(|| anyhow::format_err!("invalid TAINT_MMIO_START"))?;
     let end = parse_u64_with_prefix(
         &std::env::var("TAINT_MMIO_END").unwrap_or_else(|_| "0x60000000".to_string()),
-    )?;
+    )
+    .ok_or_else(|| anyhow::format_err!("invalid TAINT_MMIO_END"))?;
     let ppb_start = parse_u64_with_prefix(
         &std::env::var("TAINT_PPB_START").unwrap_or_else(|_| "0xE0000000".to_string()),
-    )?;
+    )
+    .ok_or_else(|| anyhow::format_err!("invalid TAINT_PPB_START"))?;
     let ppb_end = parse_u64_with_prefix(
         &std::env::var("TAINT_PPB_END").unwrap_or_else(|_| "0xF0000000".to_string()),
-    )?;
+    )
+    .ok_or_else(|| anyhow::format_err!("invalid TAINT_PPB_END"))?;
 
     let mut ranges = Vec::new();
     if start < end {
