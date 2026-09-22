@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     debugging::trace::IoTracer,
     input::StreamKey,
-    phase_b::{MagicEvidence, PhaseBObserver},
+    phase_b::{ChecksumEvidence, GateOutcome, MagicEvidence, PhaseBObserver},
     taint::AccessContext,
 };
 
@@ -55,10 +55,11 @@ pub enum Role {
 /// firmware compared those bytes against (empty when the role is not gated on
 /// a specific value).
 ///
-/// `stream_level` marks the cases where the discriminant is a property of the
-/// whole stream rather than of this position (see `StreamConstraint`): the byte
-/// is subject to a delimiter test, so a mutator must not treat the constant as
-/// the value this position has to hold.
+/// `stream_level` is set when **every** discriminant of this entry is a
+/// stream-level value (see `StreamConstraint`): the only thing asserted about
+/// these bytes is the delimiter test, so a mutator must not treat those constants
+/// as the values this position has to hold.  An entry that carries a positional
+/// constant as well is *not* marked -- filter the constraint values out by value.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RoleEntry {
     pub stream: StreamKey,
@@ -158,6 +159,11 @@ impl RoleMap {
     /// Not called yet: this is the query the mutation stage will use to look up a
     /// byte's contract, so the dead-code lint is silenced here rather than
     /// project-wide (a genuinely dead helper must stay visible).
+    ///
+    /// A caller that goes on to fill the position from `discriminants` must skip
+    /// entries with `stream_level = true` (see [`StreamConstraint`]): those
+    /// constants are properties of the stream, and backfilling them positionally
+    /// is what turns a terminator into a wall of delimiters.
     #[allow(dead_code)]
     pub fn role_at(&self, stream: StreamKey, offset: u32) -> Option<&RoleEntry> {
         self.entries
@@ -267,6 +273,17 @@ impl ReadLedger {
             next_seq: Arc::new(Mutex::new(0)),
             limit,
         }
+    }
+
+    /// Record one read, for a test that has no VM to trace.
+    ///
+    /// `record` itself stays private: the tracer is the only production caller, and
+    /// widening it would invite a second one that bypasses the pipeline.  This door
+    /// exists so the multi-pass regression in `debugging::replay` can put reads in
+    /// the ledger and then check that the next pass sees none of them.
+    #[cfg(test)]
+    pub fn record_for_test(&self, site_pc: u64, stream: StreamKey, value: &[u8]) {
+        self.record(site_pc, stream, 0, value, Default::default());
     }
 
     fn record(
@@ -597,6 +614,20 @@ pub struct AnalysisReport {
     pub loop_bounds: usize,
     pub table_loads: usize,
     pub checksum_events: usize,
+    /// Bit tests on input-derived data that were reported (samples, not rows).
+    pub gate_tests: usize,
+    /// Checksum-shaped events refused as evidence-only: a flag pair (a condition
+    /// being computed) or a comparison whose two sides are the same read.  Kept
+    /// apart from `checksum_events` so that counter keeps meaning "stated a
+    /// checksum", and so the refusals stay countable rather than invisible.
+    pub rejected_checksum_events: usize,
+    /// Bounded reads whose stream carries no data role: the gate swept in the
+    /// firmware's own register polls.  They are reads of device state, not of the
+    /// payload the bound was about, so they produce no payload role.
+    pub device_state_bounded_reads: usize,
+    /// Stores whose reported `value` is a placeholder because the interpreter
+    /// could not resolve it (see `PhaseBObserver::on_tainted_store`).
+    pub store_values_unknown: usize,
     pub bounded_reads_marked: usize,
     /// Reads that belong to read sites the analysis deliberately dropped (a PC
     /// that served more than one stream cannot be represented at all).  Expected
@@ -609,11 +640,25 @@ pub struct AnalysisReport {
     pub data_streams: usize,
     /// Streams the firmware only read in order to see its own device state.
     pub device_state_streams: usize,
-    /// Input bytes that went to data streams, ...
+    /// Input bytes on streams the firmware *judged* (compared, bounded, indexed).
     pub protocol_bytes: u64,
-    /// ... and input bytes that went to device-state streams.  The ratio is the
-    /// budget argument: the analysis is what makes it measurable per run.
+    /// Input bytes on streams that were only *moved* into memory (a `store` sink
+    /// and nothing stronger).  Kept apart from `protocol_bytes` so a copied device
+    /// register cannot inflate the protocol budget.
+    pub consumed_bytes: u64,
+    /// Streams whose only sink is a store.
+    pub consumed_streams: usize,
+    /// Input bytes that went to device-state streams (no sink at all).  The ratio
+    /// with the two above is the budget argument: the analysis is what makes it
+    /// measurable per run.
     pub device_state_bytes: u64,
+    /// Magic entries the output stage dropped because nothing was *asserted*
+    /// about them: every comparison behind them was demoted by the engine (a
+    /// pointer, a boundary of a derived value, or a flag), so there was no claim
+    /// left to make.  Reported so the action is a number in the diff rather than a
+    /// silent disappearance -- and so the pruning can be told apart from a loss of
+    /// recall.
+    pub pruned_magic_entries: usize,
     pub passes: usize,
 }
 
@@ -655,6 +700,63 @@ pub struct MagicSite {
     /// Whether the compared value's taint came from the register file's shadow
     /// rather than from a definition in the interpreted group.
     pub from_fallback: bool,
+    /// Whether the compared value came from the literal-pool fallback (the
+    /// comparison had no constant operand and the value was read off the other
+    /// operand) rather than from an immediate the comparison stated.
+    ///
+    /// Orthogonal to `from_fallback`: that one is about the *taint's* origin, this
+    /// one about the *constant's*.  Kept per event so a future policy (capping the
+    /// fallback, or allow-listing comparison points) can be evaluated by joining on
+    /// `compare_pc` instead of re-running the trace.
+    pub from_pool: bool,
+}
+
+/// One checksum arm, at one instruction, with how often it fired.
+///
+/// `arm` names the rule (see `ChecksumArm` in `phase_b`), `producer_pc` the
+/// instruction that ran it -- a comparison for the compare arms, a store for the
+/// store arms -- and `width` how many read sites the event drew on (the same
+/// fingerprint `MagicSite::width` carries: a width of one means both sides of a
+/// comparison resolved to the *same* read).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct ChecksumSite {
+    pub producer_pc: u64,
+    pub arm: &'static str,
+    pub width: u32,
+    /// `None` when the event produced a checksum role; otherwise why it was
+    /// recorded as evidence only (`condition` or `single_read`).
+    pub rejected: Option<&'static str>,
+    /// Executions collapsed into this row.
+    pub events: u32,
+}
+
+/// A bit of an input value that is *under test*, with what the gate buys.
+///
+/// This is a constraint rather than a value: the firmware branches on this bit, so
+/// randomising it just loses the branch.  `coverage` is the share of samples in
+/// which the gated code went on to consume input -- the evidence that the bit
+/// really gates something worth reaching.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct GateConstraint {
+    /// The read site whose value is tested.
+    pub source_pc: u64,
+    pub stream: StreamKey,
+    /// Input span the tested value came from.
+    pub offset_range: (u32, u32),
+    /// The bit(s) under test.
+    pub mask: u64,
+    /// The branch that tests it.
+    pub branch_pc: u64,
+    /// Samples where the gated code consumed input (a read of a data stream, or a
+    /// store into memory).
+    pub confirmed: u32,
+    /// Samples where it only wrote to a peripheral register.  A weak confirmation:
+    /// it stays in the denominator and never counts as one, which is what caps such
+    /// a gate at 0.5.
+    pub weak: u32,
+    /// Samples that showed no consequence inside the window.
+    pub unobserved: u32,
+    pub confidence: f32,
 }
 
 /// A constant the firmware tests against *every* byte of a stream.
@@ -663,6 +765,22 @@ pub struct MagicSite {
 /// a positional field: the positions are free and the value is what matters when
 /// it appears.  Reporting it as a magic *field* would have the mutator write the
 /// delimiter into every byte of the stream, so the two are separated.
+///
+/// Consumer contract: a value listed here, and every role entry carrying
+/// `stream_level = true` for it, must **not** be used for positional backfill.
+/// The mutator's job for a delimiter is to ensure *some* byte of the stream holds
+/// it (or, for an escape class, to keep one reachable) -- writing `0x0d` into
+/// every byte the comparison touched instead produces a stream no input can pass.
+/// The entries are marked rather than removed so the evidence survives the
+/// decision; the decision is the consumer's.
+///
+/// The filtering has to be done **by value, against this table**, not by dropping
+/// whole entries: a position that carries both a delimiter and a genuine
+/// positional constant (the target's byte 0 holds `0x0d` *and* the command letters
+/// `p`/`l`) is one entry with both, so an entry-level rule would throw the command
+/// letters away with the delimiter.  `RoleEntry::stream_level` is only a coarse
+/// hint that such a value is present in the entry; the authoritative list of
+/// values to skip is here.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct StreamConstraint {
     pub stream: StreamKey,
@@ -686,6 +804,25 @@ pub struct RoleMapOutput {
     pub magic_sites: Vec<MagicSite>,
     /// The constants that are stream-level constraints rather than fields.
     pub stream_constraints: Vec<StreamConstraint>,
+    /// Every read site that marked its stream as consumed: `(pc, stream, reason)`.
+    ///
+    /// This is the input to the data/device split, exported so the budget can be
+    /// audited without re-running -- "why is this stream protocol data?" is
+    /// otherwise unanswerable from the artefact, and a stream can be data with no
+    /// roles at all (a store noted it, its entry did not survive).  The reason
+    /// separates the strong claims (`magic`, `length`, `table_load`) from a plain
+    /// copy into memory (`store`), which is a use of the value rather than a
+    /// contract on it.
+    pub sink_sites: Vec<(u64, StreamKey, &'static str)>,
+    /// The bits the firmware branches on, that gate input consumption.
+    pub gate_constraints: Vec<GateConstraint>,
+    /// Which rule claimed the checksum role, at which instruction, and how often.
+    ///
+    /// The role entries only say "some bytes are checksum input"; this table says
+    /// which arm said so.  It exists because the arms cannot be told apart by
+    /// confidence -- two of them share `0.5` -- and because their false-positive
+    /// costs differ, so a run has to name the arm before anything is suppressed.
+    pub checksum_sites: Vec<ChecksumSite>,
     /// Streams whose bytes carry no protocol role: the firmware read them to see
     /// its own device state (a polled status register, a clock or GPIO
     /// configuration value).  Supplying them costs input budget and buys nothing.
@@ -707,6 +844,28 @@ pub struct RoleCollector {
     classifier: SinkClassifier,
     state: Rc<RefCell<RoleCollectorState>>,
 }
+
+/// What the code behind one bit test did, accumulated over its samples.
+#[derive(Debug, Default, Clone)]
+struct GateTally {
+    /// Reads of each stream, by stream.
+    reads: BTreeMap<StreamKey, u32>,
+    /// Stores into guest memory: consumption.
+    stores: u32,
+    /// Stores into peripheral registers: the weak case.
+    device_writes: u32,
+    /// Samples with no consequence inside the window.
+    unobserved: u32,
+    /// Input span the tested value came from, grown over the samples.
+    offset: Option<(u32, u32)>,
+    branch_pc: u64,
+}
+
+/// Fewest samples a gate needs before its coverage means anything.
+///
+/// The same argument as `MIN_STREAM_LEVEL_POSITIONS`: one branch taken once says
+/// nothing about whether the bit gates anything.
+const MIN_GATE_SAMPLES: u32 = 3;
 
 #[derive(Default)]
 struct RoleCollectorState {
@@ -730,8 +889,24 @@ struct RoleCollectorState {
     /// Tainted-address loads, with the loading instruction.
     table_load_sites: Vec<(u64, Vec<AccessContext>)>,
     checksum_events: usize,
+    /// Checksum-shaped events refused as evidence-only (see `ChecksumRejection`):
+    /// a flag pair, or a comparison of one read with itself.  Counted separately
+    /// so `checksum_events` keeps meaning "events that stated a checksum".
+    rejected_checksum_events: usize,
+    /// Bit tests on input-derived data, keyed by `(source site pc, stream, mask)`.
+    gate_samples: BTreeMap<(u64, StreamKey, u64), GateTally>,
+    /// Checksum events per (instruction, arm, width).  Kept as a map so identical
+    /// executions collapse, and so the table is a summary rather than a log (the
+    /// target produced 143 events from a handful of instructions).
+    checksum_sites: BTreeMap<(u64, &'static str, u32, Option<&'static str>), u32>,
     table_loads: usize,
     bounded_reads_marked: usize,
+    /// Bounded reads dropped because their stream carries no data role (see the
+    /// report's `device_state_bounded_reads`).
+    device_state_bounded_reads: usize,
+    /// Stores whose value the interpreter could not resolve (an MMIO read's value
+    /// is unknown to the pass).  Their reported value is a placeholder.
+    store_values_unknown: usize,
     /// Number of source-load notifications received, i.e. loads the engine
     /// interpreted.  Compared against the engine's own total this exposes any
     /// drift between the two counters, which is the signature of interpretation
@@ -746,7 +921,8 @@ struct RoleCollectorState {
     /// `(pc, stream)` pairs whose reads were consumed as *data*: a magic value the
     /// firmware asserted, a length bound, a checksum chain, a tainted address, or
     /// a copy into guest memory.  A stream with none of these is device state.
-    sink_sites: BTreeSet<(u64, StreamKey)>,
+    /// `(pc, stream, reason)`; see `RoleMapOutput::sink_sites`.
+    sink_sites: BTreeSet<(u64, StreamKey, &'static str)>,
     /// `(pc, stream)` pairs whose value the firmware wrote back into a peripheral
     /// register -- the read-modify-write of a status register, which is device
     /// state and never protocol data.
@@ -806,12 +982,26 @@ impl RoleCollector {
         state.magic_sites.clear();
         state.stream_constraints.clear();
         state.table_load_sites.clear();
+        // The sink set decides the data/device split, and the budget argument is
+        // computed from it: left to accumulate, a second pass in the same process
+        // (the parent/mutant harness) would inherit the first pass's classification
+        // and report its own bytes under the other pass's streams.
+        //
+        // `read_sites` is deliberately *not* cleared: it is the discovery pass's
+        // product, injected by the driver, and not something this pass derives.
+        state.sink_sites.clear();
+        state.device_write_sites.clear();
         state.tainted_stores = 0;
         state.unbound_loads = 0;
         state.magic_compares = 0;
         state.checksum_events = 0;
+        state.rejected_checksum_events = 0;
+        state.checksum_sites.clear();
+        state.gate_samples.clear();
         state.table_loads = 0;
         state.bounded_reads_marked = 0;
+        state.device_state_bounded_reads = 0;
+        state.store_values_unknown = 0;
         state.loads_observed = 0;
         state.size_mismatches = 0;
     }
@@ -823,14 +1013,36 @@ impl RoleCollector {
         // counts as data if some read on it reached a consumption sink; everything
         // else is the firmware reading its own device state, which the fuzzer must
         // still supply but which carries no protocol role.
-        let data_streams: BTreeSet<StreamKey> =
-            state.sink_sites.iter().map(|(_, stream)| *stream).collect();
+        // Three classes, because they mean different things to the budget.  A
+        // *judged* stream had something asserted about its bytes -- compared
+        // against a constant, bounded as a length, used as an index -- so those
+        // bytes are protocol input.  A *moved* stream was only copied somewhere
+        // (`store`), which is the firmware handling a value rather than a contract
+        // on the input: on the target this is the driver caching a register, which
+        // must not inflate the protocol budget.  Everything else is device state
+        // the firmware reads to see itself.
+        let mut judged: BTreeSet<StreamKey> = BTreeSet::new();
+        let mut moved: BTreeSet<StreamKey> = BTreeSet::new();
+        for (_, stream, reason) in state.sink_sites.iter() {
+            if *reason == "store" {
+                moved.insert(*stream);
+            }
+            else {
+                judged.insert(*stream);
+            }
+        }
+        let data_streams: BTreeSet<StreamKey> = judged.union(&moved).copied().collect();
+        let sink_sites: Vec<(u64, StreamKey, &'static str)> =
+            state.sink_sites.iter().copied().collect();
         let bytes_by_stream = self.ledger.bytes_by_stream();
         let mut device_state_streams: Vec<StreamKey> = Vec::new();
-        let (mut protocol_bytes, mut device_state_bytes) = (0_u64, 0_u64);
+        let (mut protocol_bytes, mut consumed_bytes, mut device_state_bytes) = (0_u64, 0_u64, 0_u64);
         for (stream, bytes) in bytes_by_stream.iter() {
-            if data_streams.contains(stream) {
+            if judged.contains(stream) {
                 protocol_bytes += *bytes;
+            }
+            else if moved.contains(stream) {
+                consumed_bytes += *bytes;
             }
             else {
                 device_state_bytes += *bytes;
@@ -853,19 +1065,42 @@ impl RoleCollector {
             loop_bounds: state.loop_bounds.len(),
             table_loads: state.table_loads,
             checksum_events: state.checksum_events,
+            gate_tests: state.gate_samples.values().map(|t| {
+                t.stores as usize
+                    + t.device_writes as usize
+                    + t.unobserved as usize
+                    + t.reads.values().map(|n| *n as usize).sum::<usize>()
+            }).sum(),
+            rejected_checksum_events: state.rejected_checksum_events,
+            device_state_bounded_reads: state.device_state_bounded_reads,
+            store_values_unknown: state.store_values_unknown,
             bounded_reads_marked: state.bounded_reads_marked,
             dropped_site_reads,
             early_stop_leftovers,
             data_streams: data_streams.len(),
             device_state_streams: device_state_streams.len(),
             protocol_bytes,
+            consumed_bytes,
+            consumed_streams: moved.len(),
             device_state_bytes,
             role_entries: 0,
             data_blocks: 0,
+            pruned_magic_entries: 0,
             passes,
         };
         let mut loop_bounds = state.loop_bounds.clone();
         let mut magic_sites = state.magic_sites.clone();
+        let checksum_sites: Vec<ChecksumSite> = state
+            .checksum_sites
+            .iter()
+            .map(|((producer_pc, arm, width, rejected), events)| ChecksumSite {
+                producer_pc: *producer_pc,
+                arm,
+                width: *width,
+                rejected: *rejected,
+                events: *events,
+            })
+            .collect();
         let mut table_load_sites = state.table_load_sites.clone();
         // Canonical order.  This document is compared byte-for-byte by the aligned
         // parent/mutant harness, so two identical analyses must produce identical
@@ -934,7 +1169,15 @@ impl RoleCollector {
                     continue;
                 }
                 let start = fragment.offset_range.1;
-                let end = start.saturating_add((bound.count * width as u64) as u32);
+                // Saturating, not a bare cast: `(count * width) as u32` would wrap a
+                // long span into a *small* interval, i.e. it would silently mark the
+                // wrong bytes -- the same class of landmine as a one-way bit flip, a
+                // splice that was never written back and an offset that was always
+                // zero.  Today's input sizes make it unreachable; the conversion is
+                // here so that when it stops being unreachable it is visible as a
+                // clamped span rather than as a wrong one.
+                let span = bound.count.saturating_mul(u64::from(width)).min(u64::from(u32::MAX));
+                let end = start.saturating_add(span as u32);
                 if end > start {
                     derived_payload.push((bound.source.addr, (start, end), 0.85));
                 }
@@ -948,6 +1191,55 @@ impl RoleCollector {
             let entry = stream_bytes.entry(*stream).or_insert(0);
             *entry = (*entry).max(fragment.offset_range.1);
         }
+        // Bit tests: a bit that is under test and behind which the firmware
+        // consumes input is a constraint on that input, not a value to fuzz.
+        // Samples whose only consequence was a write to the firmware's own
+        // registers are the *weak* case: they stay in the denominator and never
+        // count as a confirmation, which is what caps such a gate at 0.5.
+        let mut gate_constraints = Vec::new();
+        for ((source_pc, stream, mask), tally) in &state.gate_samples {
+            let Some(offset_range) = tally.offset else { continue };
+            let confirmed: u32 = tally
+                .reads
+                .iter()
+                .filter(|(stream, _)| data_streams.contains(stream))
+                .map(|(_, n)| *n)
+                .sum::<u32>()
+                + tally.stores;
+            let weak: u32 = tally
+                .reads
+                .iter()
+                .filter(|(stream, _)| !data_streams.contains(stream))
+                .map(|(_, n)| *n)
+                .sum::<u32>()
+                + tally.device_writes;
+            let samples = confirmed + weak + tally.unobserved;
+            if samples < MIN_GATE_SAMPLES {
+                continue;
+            }
+            let coverage = confirmed as f32 / samples as f32;
+            let confidence = if coverage >= 1.0 {
+                0.8
+            }
+            else if coverage >= 0.5 {
+                0.6
+            }
+            else {
+                0.5
+            };
+            gate_constraints.push(GateConstraint {
+                source_pc: *source_pc,
+                stream: *stream,
+                offset_range,
+                mask: *mask,
+                branch_pc: tally.branch_pc,
+                confirmed,
+                weak,
+                unobserved: tally.unobserved,
+                confidence,
+            });
+        }
+        gate_constraints.sort_by_key(|g| (g.stream, g.offset_range, g.mask));
         drop(state);
 
         // A dispatching comparison chain (`cmp #0xe100` ... `cmp #0x1c200`) shows
@@ -990,6 +1282,7 @@ impl RoleCollector {
                     .insert(entry.offset_range.0);
             }
         }
+
         let mut stream_constraints = Vec::new();
         let mut stream_level: BTreeSet<(StreamKey, u64)> = BTreeSet::new();
         for ((stream, value), positions) in per_value {
@@ -1009,25 +1302,46 @@ impl RoleCollector {
                 positions: positions.len() as u32,
             });
         }
+        // `stream_level` means "this entry states *only* stream-level values": a
+        // position that carries both a delimiter and a positional constant (the
+        // target's byte 0 holds `0x0d` *and* the command letters) is a positional
+        // field with a delimiter test on it, so it stays false and the consumer
+        // filters the constraint values out *by value* against
+        // `stream_constraints`.  Marking the whole entry would throw the command
+        // letters away with the delimiter.
         for entry in &mut role_map.entries {
-            if entry.role == Role::Magic
-                && entry
-                    .discriminants
-                    .iter()
-                    .any(|value| stream_level.contains(&(entry.stream, *value)))
-            {
-                entry.stream_level = true;
+            if entry.role != Role::Magic || entry.discriminants.is_empty() {
+                continue;
             }
+            entry.stream_level = entry
+                .discriminants
+                .iter()
+                .all(|value| stream_level.contains(&(entry.stream, *value)));
         }
 
         // A magic role with nothing asserted about it is not a role: every
         // comparison that produced it was demoted (a pointer, a boundary of a
         // derived value, or a flag), so there is no claim left to make.  The raw
         // events stay in `magic_sites` for the audit trail.
+        //
+        // This is the output half of the demotion, and it is the half that matters
+        // to a mutator: the engine's 0.3 only labels the event, and `discriminants`
+        // only ever receives values from *asserted* comparisons, so an entry whose
+        // list is empty has no assertion behind it -- the demoted value must not
+        // become something the mutation side tries to write into the input.  The
+        // count is reported because a dropped entry is otherwise only visible as a
+        // diff.
+        let mut pruned_magic_entries = 0usize;
         role_map.entries.retain(|entry| {
-            entry.role != Role::Magic
-                || entry.confidence >= ASSERTED_DISCRIMINANT_CONFIDENCE
-                || !entry.discriminants.is_empty()
+            if entry.role != Role::Magic {
+                return true;
+            }
+            let asserted = entry.confidence >= ASSERTED_DISCRIMINANT_CONFIDENCE
+                && !entry.discriminants.is_empty();
+            if !asserted {
+                pruned_magic_entries += 1;
+            }
+            asserted
         });
 
         role_map
@@ -1039,6 +1353,7 @@ impl RoleCollector {
         let report = AnalysisReport {
             role_entries: role_map.len(),
             data_blocks: blocks.len(),
+            pruned_magic_entries,
             ..counters
         };
         RoleMapOutput {
@@ -1047,6 +1362,9 @@ impl RoleCollector {
             loop_bounds,
             magic_sites,
             stream_constraints,
+            gate_constraints,
+            sink_sites,
+            checksum_sites,
             device_state_streams,
             table_load_sites,
             report,
@@ -1108,10 +1426,17 @@ impl RoleCollector {
     }
 
     /// Note that these reads were consumed as data rather than as device state.
-    fn note_sinks(&self, sources: &[AccessContext]) {
+    ///
+    /// `reason` records *which* event made the claim.  The budget argument rests
+    /// on this set -- a stream is protocol data because something here said so --
+    /// and the events are not equally strong: a comparison against a stated
+    /// constant or a length bound is a contract, while a copy into memory is only
+    /// a use of the value.  Without the reason, "why is this device register's
+    /// stream counted as protocol bytes?" is unanswerable from the artefact.
+    fn note_sinks(&self, sources: &[AccessContext], reason: &'static str) {
         let mut state = self.state.borrow_mut();
         for source in sources {
-            state.sink_sites.insert((source.pc, source.addr));
+            state.sink_sites.insert((source.pc, source.addr, reason));
         }
     }
 }
@@ -1129,10 +1454,20 @@ impl PhaseBObserver for RoleCollector {
         _addr: u64,
         _size: u8,
         _value: u64,
+        value_known: bool,
     ) {
-        self.state.borrow_mut().tainted_stores += 1;
+        {
+            let mut state = self.state.borrow_mut();
+            state.tainted_stores += 1;
+            // A store whose value the interpreter could not resolve is still a
+            // consumption, but its `value` is a placeholder: counted apart so the
+            // audit trail cannot read "unknown" as "zero".
+            if !value_known {
+                state.store_values_unknown += 1;
+            }
+        }
         // A copy into guest memory is the clearest use of the bytes as data.
-        self.note_sinks(sources);
+        self.note_sinks(sources, "store");
         let role = self.classifier.classify(pc).unwrap_or(Role::Propagated);
         let confidence = if role == Role::Propagated { 0.4 } else { 0.9 };
         self.emit_role(sources, role, confidence, &[]);
@@ -1158,7 +1493,7 @@ impl PhaseBObserver for RoleCollector {
         // Only an asserted comparison says the firmware consumed these bytes as
         // data; a demoted one is evidence, not consumption.
         if confidence >= ASSERTED_DISCRIMINANT_CONFIDENCE {
-            self.note_sinks(sources);
+            self.note_sinks(sources, "magic");
         }
         {
             let mut state = self.state.borrow_mut();
@@ -1171,6 +1506,7 @@ impl PhaseBObserver for RoleCollector {
                     width,
                     compare_pc: evidence.compare_pc,
                     from_fallback: evidence.from_fallback,
+                    from_pool: evidence.from_pool,
                 });
             }
         }
@@ -1208,7 +1544,7 @@ impl PhaseBObserver for RoleCollector {
         // Only the source is consumption evidence: the target is *bounded* by the
         // length, and on this target that included the status register the gate
         // was polled through, which is not data.
-        self.note_sinks(&[source]);
+        self.note_sinks(&[source], "length");
         for occ in source_occs {
             let read = AccessContext::at(source.pc, source.addr, *occ);
             self.emit_role(&[read], Role::Length, 0.7, &[]);
@@ -1217,9 +1553,74 @@ impl PhaseBObserver for RoleCollector {
 
     fn on_bounded_read(&mut self, read: AccessContext) {
         // A byte read while a length field was in effect is part of the payload
-        // that length paid for.
-        self.state.borrow_mut().bounded_reads_marked += 1;
-        self.emit_role(&[read], Role::Payload, 0.8, &[]);
+        // that length paid for -- but only if its stream is one the firmware
+        // consumes as data at all.
+        //
+        // A gate stays in effect across everything that runs while it is live,
+        // and on the target that included the interrupt handler's own register
+        // polls: 363 reads of ISR/ICR/CR1 were "bounded" by a gate opened on the
+        // console stream, and marking them payload turned the device-state budget
+        // into protocol bytes.  A read whose stream never reaches a sink is the
+        // firmware looking at its own device, so it is counted and dropped.
+        //
+        // The sink set is complete by the time bounded reads are reported: they
+        // come from `emit_observations`, which runs after every magic, checksum,
+        // store and table-load event of the pass.  The bound's own source is
+        // marked as a sink just before its bounded reads (see `on_loop_bound`), so
+        // the common single-stream shape -- `[MAGIC][LEN][PAYLOAD]` -- always
+        // keeps its payload even if nothing else noted the stream.
+        let is_data_stream = {
+            let mut state = self.state.borrow_mut();
+            if state.sink_sites.iter().any(|(_, stream, _)| *stream == read.addr) {
+                state.bounded_reads_marked += 1;
+                true
+            }
+            else {
+                state.device_state_bounded_reads += 1;
+                false
+            }
+        };
+        if is_data_stream {
+            self.emit_role(&[read], Role::Payload, 0.8, &[]);
+        }
+    }
+
+    fn on_gate_test(
+        &mut self,
+        sources: &[AccessContext],
+        mask: u64,
+        branch_pc: u64,
+        outcome: GateOutcome,
+    ) {
+        let Some(first) = sources.first().copied() else { return };
+        let mut state = self.state.borrow_mut();
+        // The span the *tested value* came from: gathered before touching the
+        // tally, because that needs the state mutably.
+        let mut span: Option<(u32, u32)> = None;
+        for source in sources {
+            if let Some(fragment) = state.fragments.get(&(source.pc, source.addr, source.occ)) {
+                span = Some(match span {
+                    Some((a, b)) => (a.min(fragment.offset_range.0), b.max(fragment.offset_range.1)),
+                    None => fragment.offset_range,
+                });
+            }
+        }
+        let tally = state.gate_samples.entry((first.pc, first.addr, mask)).or_default();
+        if tally.offset.is_none() {
+            tally.branch_pc = branch_pc;
+        }
+        if let Some(span) = span {
+            tally.offset = Some(match tally.offset {
+                Some((a, b)) => (a.min(span.0), b.max(span.1)),
+                None => span,
+            });
+        }
+        match outcome {
+            GateOutcome::Read { addr, .. } => *tally.reads.entry(addr).or_insert(0) += 1,
+            GateOutcome::Store { device: false, .. } => tally.stores += 1,
+            GateOutcome::Store { device: true, .. } => tally.device_writes += 1,
+            GateOutcome::Unobserved => tally.unobserved += 1,
+        }
     }
 
     fn on_table_load(&mut self, addr_sources: &[AccessContext], pc: u64) {
@@ -1227,15 +1628,49 @@ impl PhaseBObserver for RoleCollector {
         // the value; the event is checksum evidence (see the store path in the
         // engine), and its provenance is what an index/offset role needs.  Using a
         // byte as an address is also the clearest sign it is data.
-        self.note_sinks(addr_sources);
+        self.note_sinks(addr_sources, "table_load");
         let mut state = self.state.borrow_mut();
         state.table_loads += 1;
         state.table_load_sites.push((pc, addr_sources.to_vec()));
     }
 
-    fn on_checksum(&mut self, sources: &[AccessContext], confidence: f32) {
-        self.state.borrow_mut().checksum_events += 1;
-        self.note_sinks(sources);
+    fn on_checksum(
+        &mut self,
+        sources: &[AccessContext],
+        confidence: f32,
+        evidence: ChecksumEvidence,
+    ) {
+        {
+            let mut state = self.state.borrow_mut();
+            if evidence.rejection.is_some() {
+                state.rejected_checksum_events += 1;
+            }
+            else {
+                state.checksum_events += 1;
+            }
+            // Which arm, at which instruction, over how many read sites: the arm
+            // is what a policy decision needs, and the width separates a
+            // comparison of one read with itself from one of two reads.  Rejected
+            // events are kept in the same table with their reason, so a run still
+            // shows what was refused and where -- suppressing them silently is how
+            // a fix becomes unauditable.
+            *state
+                .checksum_sites
+                .entry((
+                    evidence.producer_pc,
+                    evidence.arm.as_str(),
+                    sources.len() as u32,
+                    evidence.rejection.map(|r| r.as_str()),
+                ))
+                .or_insert(0) += 1;
+        }
+        if evidence.rejection.is_some() {
+            // No sink note either: the point of the rejection is that these bytes
+            // are *not* consumed as data, and the sink set is what separates the
+            // protocol budget from the device-state budget.
+            return;
+        }
+        self.note_sinks(sources, "checksum");
         self.emit_role(sources, Role::Checksum, confidence, &[]);
     }
 }
@@ -1429,7 +1864,7 @@ mod tests {
         let mut collector = RoleCollector::new(ledger, classifier);
         let source = AccessContext::new(0x100, 0x4000);
         collector.on_source_load(source, 2);
-        collector.on_tainted_store(&[source], 0x200, 0x2000_0000, 2, 0x4241);
+        collector.on_tainted_store(&[source], 0x200, 0x2000_0000, 2, 0x4241, true);
 
         let map = collector.role_map();
         assert_eq!(map.len(), 1);
@@ -1447,7 +1882,7 @@ mod tests {
         let mut collector = RoleCollector::new(ledger, SinkClassifier::new());
         let source = AccessContext::new(0x100, 0x4000);
         collector.on_source_load(source, 2);
-        collector.on_tainted_store(&[source], 0x200, 0x2000_0000, 2, 0);
+        collector.on_tainted_store(&[source], 0x200, 0x2000_0000, 2, 0, true);
 
         assert!(
             collector.role_map().entries.is_empty(),
@@ -1487,6 +1922,82 @@ mod tests {
         let map = collector.role_map();
         assert_eq!(map.len(), 1, "one range, one role, two discriminants");
         assert_eq!(map.entries[0].discriminants, vec![0x41, 0x42]);
+    }
+
+    /// A bound pays for the payload of a stream the firmware consumes as data --
+    /// not for whatever else happened to run while the gate was live.
+    ///
+    /// On the target the gate opened on the console stream stayed in effect across
+    /// the interrupt handler, so it "bounded" 363 reads of the UART's own status
+    /// registers; marking those payload is what turned the device-state budget into
+    /// protocol bytes.
+    #[test]
+    fn bounded_read_on_a_device_stream_is_not_payload() {
+        let ledger = ReadLedger::new();
+        ledger.record(0x200, 0x5800_0008, 0, &[4], Default::default());
+        ledger.record(0x300, 0x4001_381c, 0, &[0, 0, 0, 0], Default::default());
+
+        let mut collector = RoleCollector::new(ledger, SinkClassifier::new());
+        let length = AccessContext::new(0x200, 0x5800_0008);
+        let device = AccessContext::at(0x300, 0x4001_381c, 1);
+        collector.on_source_load(length, 1);
+        collector.on_source_load(device, 4);
+        collector.on_loop_bound(
+            AccessContext::site(0x200, 0x5800_0008),
+            &[1],
+            AccessContext::site(0x300, 0x4001_381c),
+            4,
+            4,
+        );
+        collector.on_bounded_read(device);
+
+        let output = collector.output(1);
+        assert_eq!(output.report.bounded_reads_marked, 0);
+        assert_eq!(output.report.device_state_bounded_reads, 1);
+        assert!(
+            output.role_map.entries_for_stream(0x4001_381c).next().is_none(),
+            "a device poll swept in by a gate is not payload: {:?}",
+            output.role_map.entries
+        );
+        assert!(output.device_state_streams.contains(&0x4001_381c));
+    }
+
+    /// ... and the single-stream shape keeps its payload: the bound's own source
+    /// marks that stream as consumed just before its bounded reads are reported.
+    #[test]
+    fn bounded_read_on_the_length_own_stream_is_payload() {
+        let stream = 0x5800_0000;
+        let ledger = ReadLedger::new();
+        ledger.record(0x200, stream, 0, &[4], Default::default());
+        ledger.record(0x300, stream, 1, &[0x41], Default::default());
+
+        let mut collector = RoleCollector::new(ledger, SinkClassifier::new());
+        collector.on_source_load(AccessContext::new(0x200, stream), 1);
+        collector.on_source_load(AccessContext::new(0x300, stream), 1);
+        collector.on_loop_bound(
+            AccessContext::site(0x200, stream),
+            &[1],
+            AccessContext::site(0x300, stream),
+            4,
+            4,
+        );
+        collector.on_bounded_read(AccessContext::at(0x300, stream, 1));
+
+        let output = collector.output(1);
+        assert_eq!(output.report.bounded_reads_marked, 1);
+        assert_eq!(output.report.device_state_bounded_reads, 0);
+        let payload: Vec<_> = output
+            .role_map
+            .entries_for_stream(stream)
+            .filter(|e| e.role == Role::Payload)
+            .map(|e| e.offset_range)
+            .collect();
+        // The per-read mark and the relation-derived span merge, so the assertion
+        // is that the consumed byte is covered -- not that nothing else is.
+        assert!(
+            payload.iter().any(|(start, end)| *start <= 1 && 1 < *end),
+            "the byte the loop consumed must be payload: {payload:?}"
+        );
     }
 
     #[test]
@@ -1532,7 +2043,7 @@ mod tests {
         collector.on_source_load(source, 1);
         collector.on_magic_compare(&[source], 0x41, 0.85, MagicEvidence::at(0x200));
         collector.on_source_load(source, 4);
-        collector.on_tainted_store(&[source], 0x200, 0x2000_0000, 4, 9);
+        collector.on_tainted_store(&[source], 0x200, 0x2000_0000, 4, 9, true);
 
         let map = collector.role_map();
         assert_eq!(map.len(), 2, "magic byte and payload bytes are different ranges");
@@ -1771,6 +2282,301 @@ mod tests {
         );
     }
 
+    /// `stream_level` means "every discriminant here is a stream-level value": a
+    /// position that also carries a positional constant must stay false, or the
+    /// consumer would throw the positional half away with the delimiter.
+    #[test]
+    fn stream_level_requires_every_discriminant_to_be_a_constraint() {
+        let stream = 0x5800_0000;
+        let ledger = ReadLedger::new();
+        for offset in 0..4u32 {
+            ledger.record(0x200, stream, offset, &[0x0d], Default::default());
+        }
+
+        let mut collector = RoleCollector::new(ledger, SinkClassifier::new());
+        for occ in 1..=4u32 {
+            let read = AccessContext::at(0x200, stream, occ);
+            collector.on_source_load(read, 1);
+            collector.on_magic_compare(&[read], 0x0d, 0.85, MagicEvidence::at(0x210));
+        }
+        // The first position also carries a command letter.
+        collector.on_magic_compare(
+            &[AccessContext::at(0x200, stream, 1)],
+            0x70,
+            0.85,
+            MagicEvidence::at(0x214),
+        );
+
+        let output = collector.output(1);
+        assert_eq!(output.stream_constraints.len(), 1, "the delimiter is a constraint");
+        let mixed = output.role_map.role_at(stream, 0).unwrap();
+        assert_eq!(mixed.discriminants, vec![0x0d, 0x70]);
+        assert!(
+            !mixed.stream_level,
+            "a positional constant rides on this entry, so it is not stream-level"
+        );
+        assert!(
+            output.role_map.role_at(stream, 1).unwrap().stream_level,
+            "a position that only ever saw the delimiter is"
+        );
+    }
+
+    /// The budget has three parts, not two: what the firmware *judged* about the
+    /// input, what it merely *moved* into memory, and what it read to see itself.
+    #[test]
+    fn budget_separates_judged_from_moved_bytes() {
+        let ledger = ReadLedger::new();
+        ledger.record(0x100, 0x4000, 0, &[1], Default::default()); // judged
+        ledger.record(0x110, 0x4004, 0, &[2], Default::default()); // moved
+        ledger.record(0x120, 0x4008, 0, &[3], Default::default()); // never consumed
+
+        let mut collector = RoleCollector::new(ledger, SinkClassifier::new());
+        let judged = AccessContext::new(0x100, 0x4000);
+        let moved = AccessContext::new(0x110, 0x4004);
+        let untouched = AccessContext::new(0x120, 0x4008);
+        for read in [judged, moved, untouched] {
+            collector.on_source_load(read, 1);
+        }
+        collector.on_magic_compare(&[judged], 0x41, 0.85, MagicEvidence::at(0x200));
+        collector.on_tainted_store(&[moved], 0x300, 0x2000_0000, 1, 0x42, true);
+
+        let output = collector.output(1);
+        assert_eq!(output.report.protocol_bytes, 1, "the compared byte");
+        assert_eq!(output.report.consumed_bytes, 1, "the copied byte");
+        assert_eq!(output.report.device_state_bytes, 1, "the untouched byte");
+        assert_eq!(output.report.consumed_streams, 1);
+        assert_eq!(output.report.data_streams, 2, "judged + moved still counts as data");
+        assert!(output.device_state_streams.contains(&0x4008));
+        assert!(
+            !output.device_state_streams.contains(&0x4004),
+            "a moved stream is not device state, and not protocol either"
+        );
+    }
+
+    /// Two positions is a coincidence, not a coverage claim: a short stream must
+    /// not turn its every-byte hit into a delimiter class.
+    #[test]
+    fn stream_level_needs_more_than_a_couple_of_positions() {
+        let stream = 0x5800_0000;
+        let ledger = ReadLedger::new();
+        for offset in 0..2u32 {
+            ledger.record(0x200, stream, offset, &[0x0d], Default::default());
+        }
+
+        let mut collector = RoleCollector::new(ledger, SinkClassifier::new());
+        for occ in 1..=2u32 {
+            let read = AccessContext::at(0x200, stream, occ);
+            collector.on_source_load(read, 1);
+            collector.on_magic_compare(&[read], 0x0d, 0.85, MagicEvidence::at(0x210));
+        }
+
+        let output = collector.output(1);
+        assert!(
+            output.stream_constraints.is_empty(),
+            "2/2 is not coverage: {:?}",
+            output.stream_constraints
+        );
+        assert!(!output.role_map.role_at(stream, 0).unwrap().stream_level);
+        // The per-position evidence is untouched by the refusal.
+        assert_eq!(output.role_map.role_at(stream, 0).unwrap().discriminants, vec![0x0d]);
+    }
+
+    /// The checksum table has to name the rule and the instruction: the confidence
+    /// does not identify the rule (two arms share `0.5`), and each arm needs a
+    /// different decision.
+    #[test]
+    fn checksum_events_are_attributed_to_their_arm() {
+        let ledger = ReadLedger::new();
+        ledger.record(0x100, 0x4000, 0, &[0x41], Default::default());
+        ledger.record(0x104, 0x4004, 0, &[0x42], Default::default());
+        ledger.record(0x108, 0x4008, 0, &[0x43], Default::default());
+
+        let mut collector = RoleCollector::new(ledger, SinkClassifier::new());
+        let a = AccessContext::new(0x100, 0x4000);
+        let b = AccessContext::new(0x104, 0x4004);
+        let refused = AccessContext::new(0x108, 0x4008);
+        for read in [a, b, refused] {
+            collector.on_source_load(read, 1);
+        }
+
+        let echo = |pc: u64| ChecksumEvidence {
+            producer_pc: pc,
+            arm: crate::phase_b::ChecksumArm::CompareOtherTainted,
+            rejection: None,
+        };
+        // The same comparison reached twice: one row, two executions.
+        collector.on_checksum(&[a, b], 0.5, echo(0x200));
+        collector.on_checksum(&[a, b], 0.5, echo(0x200));
+        // A different rule, at a different instruction, over a single read site.
+        collector.on_checksum(
+            &[a],
+            0.6,
+            ChecksumEvidence {
+                producer_pc: 0x204,
+                arm: crate::phase_b::ChecksumArm::CompareMixedDirect,
+                rejection: None,
+            },
+        );
+        // Refused: a condition computed from one read.  It stays in the table with
+        // its reason, produces no role, and marks no stream as consumed.
+        collector.on_checksum(
+            &[refused],
+            0.5,
+            ChecksumEvidence {
+                producer_pc: 0x208,
+                arm: crate::phase_b::ChecksumArm::EqualBothTainted,
+                rejection: Some(crate::phase_b::ChecksumRejection::Condition),
+            },
+        );
+
+        let output = collector.output(1);
+        assert_eq!(output.report.checksum_events, 3, "accepted events keep their own counter");
+        assert_eq!(output.report.rejected_checksum_events, 1);
+        assert_eq!(
+            output.checksum_sites.len(),
+            3,
+            "identical executions collapse: {:?}",
+            output.checksum_sites
+        );
+        assert_eq!(output.checksum_sites[0].producer_pc, 0x200);
+        assert_eq!(output.checksum_sites[0].arm, "compare_other_tainted");
+        assert_eq!(output.checksum_sites[0].width, 2);
+        assert_eq!(output.checksum_sites[0].rejected, None);
+        assert_eq!(output.checksum_sites[0].events, 2);
+        assert_eq!(output.checksum_sites[1].producer_pc, 0x204);
+        assert_eq!(output.checksum_sites[1].arm, "compare_mixed_direct");
+        assert_eq!(output.checksum_sites[1].width, 1);
+        assert_eq!(output.checksum_sites[2].producer_pc, 0x208);
+        assert_eq!(output.checksum_sites[2].rejected, Some("condition"));
+        // A refused event is not consumption evidence: its stream stays out of the
+        // data set, which is what the protocol/device budget is computed from.
+        assert!(
+            output.role_map.entries_for_stream(0x4008).next().is_none(),
+            "a refused event must not produce a role"
+        );
+        assert!(output.device_state_streams.contains(&0x4008));
+    }
+
+    /// A bit test becomes a constraint only when the code behind it consumes input:
+    /// a sample whose only consequence was a write to the device's own registers is
+    /// weak, stays out of the numerator, and caps the confidence.
+    #[test]
+    fn gate_constraints_are_mined_from_their_outcomes() {
+        let ledger = ReadLedger::new();
+        ledger.record(0x100, 0x4000, 0, &[0x20], Default::default());
+
+        let mut collector = RoleCollector::new(ledger, SinkClassifier::new());
+        let source = AccessContext::new(0x100, 0x4000);
+        collector.on_source_load(source, 1);
+        // The tested stream is data because something judged it.
+        collector.on_magic_compare(&[source], 0x20, 0.85, MagicEvidence::at(0x200));
+        // Two samples where the gate bought a read of that data, one where it only
+        // bought a write to a peripheral register.
+        for _ in 0..2 {
+            collector.on_gate_test(
+                &[source],
+                0x20,
+                0x204,
+                GateOutcome::Read { pc: 0x300, addr: 0x4000 },
+            );
+        }
+        collector.on_gate_test(
+            &[source],
+            0x20,
+            0x204,
+            GateOutcome::Store { pc: 0x310, device: true },
+        );
+
+        let output = collector.output(1);
+        assert_eq!(output.report.gate_tests, 3);
+        assert_eq!(output.gate_constraints.len(), 1, "{:?}", output.gate_constraints);
+        let gate = output.gate_constraints[0];
+        assert_eq!(gate.mask, 0x20, "the bit under test");
+        assert_eq!(gate.branch_pc, 0x204);
+        assert_eq!(gate.stream, 0x4000);
+        assert_eq!(gate.offset_range, (0, 1), "the tested byte");
+        assert_eq!((gate.confirmed, gate.weak, gate.unobserved), (2, 1, 0));
+        assert_eq!(gate.confidence, 0.6, "a weak sample is not a confirmation");
+    }
+
+    /// Two samples are not a coverage claim, here as everywhere else.
+    #[test]
+    fn gate_constraint_needs_enough_samples() {
+        let ledger = ReadLedger::new();
+        ledger.record(0x100, 0x4000, 0, &[0x20], Default::default());
+
+        let mut collector = RoleCollector::new(ledger, SinkClassifier::new());
+        let source = AccessContext::new(0x100, 0x4000);
+        collector.on_source_load(source, 1);
+        collector.on_magic_compare(&[source], 0x20, 0.85, MagicEvidence::at(0x200));
+        for _ in 0..2 {
+            collector.on_gate_test(
+                &[source],
+                0x20,
+                0x204,
+                GateOutcome::Read { pc: 0x300, addr: 0x4000 },
+            );
+        }
+
+        let output = collector.output(1);
+        assert_eq!(output.report.gate_tests, 2);
+        assert!(
+            output.gate_constraints.is_empty(),
+            "two samples is not enough: {:?}",
+            output.gate_constraints
+        );
+    }
+
+    /// A comparison the engine demoted is evidence, not a contract: it stays in
+    /// `magic_sites` and never becomes a value the mutator would write.
+    #[test]
+    fn demoted_discriminant_is_evidence_only_in_the_role_map() {
+        let ledger = ReadLedger::new();
+        ledger.record(0x100, 0x4000, 0, &[0x41], Default::default());
+
+        let mut collector = RoleCollector::new(ledger, SinkClassifier::new());
+        let source = AccessContext::new(0x100, 0x4000);
+        collector.on_source_load(source, 1);
+        // A pointer comparison reached through input taint: the engine reports it
+        // below the threshold rather than dropping it.
+        collector.on_magic_compare(
+            &[source],
+            0x2000_0e70,
+            0.3,
+            MagicEvidence { compare_pc: 0x208, from_fallback: true, from_pool: false },
+        );
+
+        let output = collector.output(1);
+        assert!(output.role_map.entries.is_empty(), "no assertion, no entry");
+        assert_eq!(output.report.pruned_magic_entries, 1, "and the drop is counted");
+        assert_eq!(output.magic_sites.len(), 1, "the evidence survives");
+        assert_eq!(output.magic_sites[0].value, 0x2000_0e70);
+        assert_eq!(output.magic_sites[0].compare_pc, 0x208);
+    }
+
+    /// A position that carries both an asserted constant and a demoted one keeps
+    /// only the asserted value: the demoted one must not ride in on the entry the
+    /// other event created.
+    #[test]
+    fn mixed_entry_keeps_only_asserted_discriminants() {
+        let ledger = ReadLedger::new();
+        ledger.record(0x100, 0x4000, 0, &[0x0d], Default::default());
+
+        let mut collector = RoleCollector::new(ledger, SinkClassifier::new());
+        let source = AccessContext::new(0x100, 0x4000);
+        collector.on_source_load(source, 1);
+        collector.on_magic_compare(&[source], 0x0d, 0.85, MagicEvidence::at(0x200));
+        collector.on_magic_compare(&[source], 0x2000_0e70, 0.3, MagicEvidence::at(0x204));
+
+        let output = collector.output(1);
+        assert_eq!(output.role_map.entries.len(), 1);
+        assert_eq!(output.role_map.entries[0].role, Role::Magic);
+        assert_eq!(output.role_map.entries[0].discriminants, vec![0x0d]);
+        assert_eq!(output.role_map.entries[0].confidence, 0.85);
+        assert_eq!(output.report.pruned_magic_entries, 0);
+        assert_eq!(output.magic_sites.len(), 2, "both comparisons stay as evidence");
+    }
+
     /// The magic evidence carries the comparison that stated the constant, and an
     /// event reached twice inside one group is one piece of evidence.
     #[test]
@@ -1787,7 +2593,7 @@ mod tests {
             &[source],
             0x41,
             0.85,
-            MagicEvidence { compare_pc: 0x208, from_fallback: true },
+            MagicEvidence { compare_pc: 0x208, from_fallback: true, from_pool: false },
         );
 
         let output = collector.output(1);

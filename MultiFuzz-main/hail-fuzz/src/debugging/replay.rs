@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     io::{Read, Write},
     path::{Path, PathBuf},
 };
@@ -271,10 +272,7 @@ fn replay_trace(mut vm: Vm, mut target: CortexmMultiStream) -> anyhow::Result<()
 
     let mut read_sites: HashMap<u64, Vec<crate::input::StreamKey>> = HashMap::new();
     if semantics_enabled {
-        if let Some(state) = &phase_b {
-            state.borrow_mut().set_armed(false);
-        }
-        ledger.clear();
+        begin_discovery_pass(&phase_b, &ledger);
         if let Err(error) = target.run(&mut vm) {
             eprintln!("[taint] discovery pass failed: {error:#}");
         }
@@ -340,6 +338,11 @@ fn replay_trace(mut vm: Vm, mut target: CortexmMultiStream) -> anyhow::Result<()
     eprintln!("registers:\n{}", icicle_vm::debug::print_regs(&vm, &reglist));
 
     if let Some(cmplog) = cmplog {
+        // Written in a canonical order (see `log_cmplog_data`): the recorder's own
+        // iteration order varies between runs, so two runs of the same seed used to
+        // differ in line order and in which side of a value pair came first.
+        // Artifacts from before that ordering are *not* normalized -- do not mix
+        // them with new ones in a diff.
         log_cmplog_data(&mut vm, cmplog, "cmplog.txt".as_ref())?;
     }
     if icicle_fuzzing::parse_bool_env("SAVE_TRACE")?.unwrap_or(true) {
@@ -398,12 +401,44 @@ fn replay_trace(mut vm: Vm, mut target: CortexmMultiStream) -> anyhow::Result<()
         //     an alignment error.
         //   * `unconsumed` is split into reads at dropped ambiguous sites (expected)
         //     and leftovers from an early stop (the actual drift signal).
+        //   * `pool_discriminants` sizes the literal-pool path (the comparison had
+        //     no constant operand, so the value came from the other operand): it
+        //     says how much of the magic map rests on a claim the firmware never
+        //     stated as an immediate.  Set against `magic` it is the open-path
+        //     budget; `MagicSite::from_pool` names the comparison points.
+        //   * `pruned_magic` counts magic entries the output stage dropped because
+        //     every comparison behind them was demoted (a pointer, a derived
+        //     value's boundary, a flag).  A drop here is the output half of the
+        //     demotion working, not recall lost -- the events remain in
+        //     `magic_sites`.
+        //   * `device_writes` counts tainted stores that went into a peripheral
+        //     register instead of memory: the interrupt-clear read-modify-write in
+        //     the UART handler, the status-bit clears.  A non-zero value is the
+        //     separation working -- those writes are neither payload nor checksum,
+        //     which is why the status bytes stopped being reported as either.
+        //   * `checksum` counts candidate arms, and the arm breakdown printed
+        //     below says which one spoke.  A conditional branch lifts to a flag
+        //     *algebra* (`bgt` is `NG == OV`), so a flag pair must not count as a
+        //     checksum of the data the flags were derived from; a run whose
+        //     `equal_both_tainted` total moves with the number of input bytes is
+        //     the signature of that mistake.
+        //   * `checksum_rejected` counts the shapes the checksum rule considered
+        //     and refused (a flag pair, or a comparison of one read with itself).
+        //     They stay in `checksum_sites` with the reason, and they mark no
+        //     stream as consumed -- which is what keeps them out of the protocol
+        //     budget below.
+        //   * `bounded_reads_device` counts reads a live gate swept in from a
+        //     stream that carries no data role: the firmware's own register polls.
+        //     They are read while the bound is in effect, but they are not the
+        //     payload the bound was about, so they produce no payload role.
         eprintln!(
             "[taint] reads={} sites={} fragments={} roles={} blocks={} stores={} \
              magic={} loop_bounds={} checksum={} table_loads={} bounded_reads={} \
              skipped_space={} stack_skipped={} unbound={} width_mismatch={} occ_mismatch={} \
              early_stops={} unconsumed={} dropped_sites={} leftovers={} demoted={} \
-             panic_disarmed={} magic_max_width={}",
+             pool_discriminants={} pruned_magic={} device_writes={} panic_disarmed={} \
+             magic_max_width={} checksum_rejected={} bounded_reads_device={} \
+             stores_value_unknown={}",
             output.report.mmio_reads,
             output.report.read_sites,
             output.report.source_fragments,
@@ -425,9 +460,70 @@ fn replay_trace(mut vm: Vm, mut target: CortexmMultiStream) -> anyhow::Result<()
             output.report.dropped_site_reads,
             output.report.early_stop_leftovers,
             counters.demoted_discriminants,
+            counters.pool_discriminants,
+            output.report.pruned_magic_entries,
+            counters.device_writes,
             counters.panic_disarmed,
-            magic_max_width
+            magic_max_width,
+            output.report.rejected_checksum_events,
+            output.report.device_state_bounded_reads,
+            output.report.store_values_unknown
         );
+        // The demotion total is an argument only when split: which mechanism took
+        // the constant away (a negated add form, a ones-run at the comparison's
+        // width, a pointer, or a boundary of a derived value).
+        if !counters.demoted_by_reason.is_empty() {
+            let parts: Vec<String> = counters
+                .demoted_by_reason
+                .iter()
+                .map(|(why, n)| format!("{why}:{n}"))
+                .collect();
+            eprintln!("[taint] demoted by reason: {}", parts.join(" "));
+        }
+        // Where the literal-pool fallback contributed: the attribution a per-site
+        // allow-list policy would be written from.
+        if !counters.pool_by_pc.is_empty() {
+            let parts: Vec<String> = counters
+                .pool_by_pc
+                .iter()
+                .map(|(pc, n)| format!("{pc:#x}:{n}"))
+                .collect();
+            eprintln!("[taint] pool discriminants by site: {}", parts.join(" "));
+        }
+        // The bits the firmware branches on.  A gate with high coverage is a
+        // constraint ("do not randomise this bit"); a weak one is the firmware
+        // serving itself and is reported at 0.5.
+        if !output.gate_constraints.is_empty() {
+            eprintln!("[taint] gate constraints: {}", output.gate_constraints.len());
+            for gate in &output.gate_constraints {
+                eprintln!(
+                    "[taint]   stream={:#x} off={:?} mask={:#x} branch_pc={:#x} \
+                     confirmed={} weak={} unobserved={} confidence={:.2}",
+                    gate.stream, gate.offset_range, gate.mask, gate.branch_pc,
+                    gate.confirmed, gate.weak, gate.unobserved, gate.confidence
+                );
+            }
+        }
+        // Which rule claimed the checksum role, and where.  The confidence does
+        // not identify the rule (two arms share 0.5) and each arm has a different
+        // false-positive cost, so a run has to name the arm before anything is
+        // suppressed.  `width` is how many read sites the event drew on: a width
+        // of one means both sides resolved to the same read.
+        if !output.checksum_sites.is_empty() {
+            let mut by_arm: BTreeMap<&str, u32> = BTreeMap::new();
+            for site in &output.checksum_sites {
+                *by_arm.entry(site.arm).or_insert(0) += site.events;
+            }
+            let totals: Vec<String> =
+                by_arm.iter().map(|(arm, n)| format!("{arm}:{n}")).collect();
+            eprintln!("[taint] checksum arms: {}", totals.join(" "));
+            for site in &output.checksum_sites {
+                eprintln!(
+                    "[taint]   arm={} producer_pc={:#x} width={} events={}",
+                    site.arm, site.producer_pc, site.width, site.events
+                );
+            }
+        }
         // `occ_mismatch == 0` on its own proves nothing: both counters advance
         // together even when the two sides are shifted.  Reads the interpreter
         // never claimed that do *not* belong to a dropped site are the actual
@@ -482,14 +578,49 @@ fn begin_analysis_pass(
     read_sites: HashMap<u64, Vec<crate::input::StreamKey>>,
     mmio_ranges: &[std::ops::Range<u64>],
 ) {
-    ledger.clear();
-    collector.reset_pass();
-    collector.set_read_sites(read_sites.clone());
+    begin_pass_state(ledger, collector, read_sites.clone());
     if let Some(state) = phase_b {
         let mut state = state.borrow_mut();
         state.reset_pass(read_sites, mmio_ranges.to_vec());
         state.set_armed(true);
     }
+}
+
+/// Start the discovery pass: the same "from zero" guarantee, but disarmed.
+///
+/// The discovery pass exists only to learn which pcs read which streams, so the
+/// engine must collect nothing; what it shares with the analysis pass is the
+/// property that the *previous* pass left nothing behind, which is why it goes
+/// through a helper rather than a hand-written pair of calls that the next driver
+/// has to remember.  It deliberately does not touch the collector: this pass
+/// produces no roles, and `begin_analysis_pass` resets the collector once the
+/// discovered read sites have been read out.
+fn begin_discovery_pass(
+    phase_b: &Option<std::rc::Rc<std::cell::RefCell<crate::phase_b::PhaseBState>>>,
+    ledger: &crate::semantic_taint::ReadLedger,
+) {
+    if let Some(state) = phase_b {
+        state.borrow_mut().set_armed(false);
+    }
+    ledger.clear();
+}
+
+/// The part of a pass start that needs no VM: the ledger, the collector and the
+/// read-site map.
+///
+/// Split out so the property can be *tested* -- a parent/mutant harness runs
+/// several passes in one process, and "the second pass sees only its own reads" is
+/// exactly the kind of thing that is obvious in prose and wrong in code (the
+/// collector used to keep its sink set across passes, which silently reclassified
+/// the next pass's bytes under the previous pass's streams).
+fn begin_pass_state(
+    ledger: &crate::semantic_taint::ReadLedger,
+    collector: &mut crate::semantic_taint::RoleCollector,
+    read_sites: HashMap<u64, Vec<crate::input::StreamKey>>,
+) {
+    ledger.clear();
+    collector.reset_pass();
+    collector.set_read_sites(read_sites);
 }
 
 /// Peripheral address ranges, used both to reject MMIO as taint-addressable
@@ -709,4 +840,59 @@ fn read_within(
         format!("error reading: {} from {}", file_path.display(), tar_path.display())
     })?;
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // `AccessContext` and `MagicEvidence` are declared elsewhere: the collector
+    // only *imports* them, and a private import is not a path a sibling module can
+    // resolve.
+    use crate::{
+        // The observer's methods are *trait* methods: without the trait in scope
+        // they are not callable at all.
+        phase_b::{MagicEvidence, PhaseBObserver},
+        semantic_taint::{ReadLedger, RoleCollector, SinkClassifier},
+        taint::AccessContext,
+    };
+
+    /// A pass must start from zero.  This is the invariant the parent/mutant
+    /// harness rests on: evidence from the previous pass must not survive into the
+    /// next one, or the two analyses being compared are a mixture.
+    #[test]
+    fn a_second_pass_sees_only_its_own_reads() {
+        let ledger = ReadLedger::new();
+        let mut collector = RoleCollector::new(ledger.clone(), SinkClassifier::new());
+
+        // First pass: a byte on stream 0x4000 is compared against a constant, so
+        // that stream counts as consumed and its bytes as protocol.
+        begin_pass_state(&ledger, &mut collector, HashMap::new());
+        ledger.record_for_test(0x100, 0x4000, &[0x41]);
+        let judged = AccessContext::new(0x100, 0x4000);
+        collector.on_source_load(judged, 1);
+        collector.on_magic_compare(&[judged], 0x41, 0.85, MagicEvidence::at(0x200));
+
+        let first = collector.output(1);
+        assert_eq!(first.report.role_entries, 1);
+        assert_eq!(first.report.protocol_bytes, 1);
+        assert_eq!(first.report.mmio_reads, 1);
+
+        // Second pass: a read on the *same* stream, but nothing consumes it.
+        // Carrying the first pass's sink set over would classify this byte as
+        // protocol bytes under the previous pass's evidence.
+        begin_pass_state(&ledger, &mut collector, HashMap::new());
+        ledger.record_for_test(0x300, 0x4000, &[0x42]);
+        collector.on_source_load(AccessContext::new(0x300, 0x4000), 1);
+
+        let second = collector.output(2);
+        assert_eq!(second.report.mmio_reads, 1, "the ledger started empty");
+        assert!(
+            second.role_map.entries.is_empty(),
+            "the previous pass's roles survived: {:?}",
+            second.role_map.entries
+        );
+        assert_eq!(second.report.protocol_bytes, 0, "no sink was noted in this pass");
+        assert_eq!(second.report.device_state_bytes, 1);
+        assert_eq!(second.report.passes, 2);
+    }
 }

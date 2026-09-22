@@ -118,15 +118,38 @@ fn read_regular_memory(cpu: &mut Cpu, addr: u64, size: u8) -> Option<u64> {
 /// group, so the return register has no definition there -- but it is also how a
 /// stale value from an unrelated block can reach an unrelated comparison, so the
 /// distinction is recorded rather than silently trusted.
+///
+/// `from_pool` is an orthogonal axis and is *not* the same thing: it says the
+/// compared value did not come from an immediate at all, but from whatever the
+/// other operand concretely held (the literal-pool form ARM uses for constants it
+/// cannot encode).  `from_fallback` answers "where did the taint come from",
+/// `from_pool` answers "where did the constant come from"; both are recorded so
+/// that a later policy can be evaluated per comparison point without re-reading a
+/// trace.
+///
+/// `from_pool` is evidence, *not* a defect: the shell's command-name comparison
+/// reads its character from the literal pool, so a blanket demotion of
+/// `from_pool` events would delete real discriminants.  A future policy has to be
+/// decided per `compare_pc` (see the note in `report_compare`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MagicEvidence {
     pub compare_pc: u64,
     pub from_fallback: bool,
+    pub from_pool: bool,
 }
 
 impl MagicEvidence {
+    /// Evidence for the ordinary case: the compared value was stated as an
+    /// immediate, and its taint was defined in the group being interpreted.
+    ///
+    /// The engine itself builds the struct field by field (it always knows both
+    /// flags), so today the callers are the collector's tests.  The lint is
+    /// silenced here rather than project-wide, the same way `RoleMap::role_at`
+    /// is: a genuinely dead helper has to stay visible, but this one is the
+    /// constructor of a type that is part of the analysis interface.
+    #[allow(dead_code)]
     pub const fn at(compare_pc: u64) -> Self {
-        Self { compare_pc, from_fallback: false }
+        Self { compare_pc, from_fallback: false, from_pool: false }
     }
 }
 
@@ -135,6 +158,13 @@ pub trait PhaseBObserver {
     fn on_source_load(&mut self, _context: AccessContext, _size: u8) {}
 
     /// A store whose stored value or address derived from MMIO input.
+    ///
+    /// `value_known` says whether `value` is the value the firmware actually
+    /// stored or only a placeholder for "the interpreter does not know": an MMIO
+    /// read's value is unknown to the pass by design (`LiveEnv::read_mem` refuses
+    /// MMIO so a read cannot consume fuzz bytes twice), and reporting that as `0`
+    /// without saying so would let "unknown" and "zero" look alike in the audit
+    /// trail.
     fn on_tainted_store(
         &mut self,
         _sources: &[AccessContext],
@@ -142,6 +172,7 @@ pub trait PhaseBObserver {
         _addr: u64,
         _size: u8,
         _value: u64,
+        _value_known: bool,
     ) {
     }
 
@@ -200,9 +231,156 @@ pub trait PhaseBObserver {
     /// chain dies here; the caller can also use the event as checksum evidence.
     fn on_table_load(&mut self, _addr_sources: &[AccessContext], _pc: u64) {}
 
+    /// A bit test on input-derived data gated what ran next.
+    ///
+    /// `mask` is the bit the firmware watched (`if (c & BIT)`), `outcome` what the
+    /// gated code did with the time it bought.  A bit that is *under test* and
+    /// behind which the firmware consumes data is a constraint on the input rather
+    /// than a value to fuzz freely: that is what the mutator needs to know, and it
+    /// is the reason the gate is reported at all.
+    fn on_gate_test(
+        &mut self,
+        _sources: &[AccessContext],
+        _mask: u64,
+        _branch_pc: u64,
+        _outcome: GateOutcome,
+    ) {
+    }
+
     /// A value that went through a mixing chain (>= 2 combining steps) and is
     /// therefore checksum-like rather than a plain payload byte.
-    fn on_checksum(&mut self, _sources: &[AccessContext], _confidence: f32) {}
+    ///
+    /// `evidence` names the instruction and the rule, because the confidence does
+    /// not identify the rule (two arms share `0.5`) and each arm has a different
+    /// false-positive cost, so the arm has to be known before anything is
+    /// suppressed.
+    fn on_checksum(
+        &mut self,
+        _sources: &[AccessContext],
+        _confidence: f32,
+        _evidence: ChecksumEvidence,
+    ) {
+    }
+}
+
+/// Which rule produced a checksum observation.
+///
+/// Every arm is a *candidate*, not a verdict: the checksum role says "these bytes
+/// feed a checksum-like computation", and on the target the per-byte claims on the
+/// console stream are exactly the kind that has to be attributed before it is
+/// believed -- a comparison between two derived values is an echo or a
+/// verification, and a comparison between two *flags* of one read is neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ChecksumArm {
+    /// A value that went through >= 2 combining steps was stored: the shape of an
+    /// accumulator being finalised, and the strongest of the arms.
+    StoreMixed,
+    /// The same, in a block that also did a table lookup: a table-driven CRC
+    /// (or a hash) being written out.
+    StoreMixedAfterTableLoad,
+    /// A mixed value compared against a constant directly.
+    CompareMixedDirect,
+    /// A mixed value compared against zero through a subtraction.
+    CompareMixedBacktrack,
+    /// A bare variable-vs-variable equality with both sides input-derived.
+    ///
+    /// Subject to two rejections (see [`ChecksumRejection`]): a comparison between
+    /// two flags is a *condition* being computed (`bgt` is `NG == OV`), and a
+    /// comparison whose two sides collapse to a single read has only one value to
+    /// compare.  What remains is the genuine echo / verification shape.
+    EqualBothTainted,
+    /// `tmp = a - b; tmp == 0` with both `a` and `b` input-derived: an echo, or a
+    /// received value checked against a computed one.  Rejected when the two sides
+    /// collapse to a single read (see [`ChecksumRejection::SingleRead`]).
+    CompareOtherTainted,
+}
+
+impl ChecksumArm {
+    /// Stable name for the report; the enum itself is not serialised so that the
+    /// engine keeps no serde dependency.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ChecksumArm::StoreMixed => "store_mixed",
+            ChecksumArm::StoreMixedAfterTableLoad => "store_mixed_after_table_load",
+            ChecksumArm::CompareMixedDirect => "compare_mixed_direct",
+            ChecksumArm::CompareMixedBacktrack => "compare_mixed_backtrack",
+            ChecksumArm::EqualBothTainted => "equal_both_tainted",
+            ChecksumArm::CompareOtherTainted => "compare_other_tainted",
+        }
+    }
+}
+
+/// What the code behind a bit test did, once it was seen.
+///
+/// The attribution window is the function the test belongs to (see
+/// `PhaseBEngine::flush_gate_tests`): a test whose consequence never showed up
+/// before control left the function is `Unobserved`, not a guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateOutcome {
+    /// The gated code read a stream at `(pc, addr)`.
+    Read { pc: u64, addr: StreamKey },
+    /// The gated code stored something; `device` says whether it went into a
+    /// peripheral register (the weak case: the firmware serving itself) or into
+    /// memory.
+    Store { pc: u64, device: bool },
+    /// Nothing observable happened before the window closed, or the gate never
+    /// met a reader or writer.
+    Unobserved,
+}
+
+impl GateOutcome {
+    /// Stable name for the outcome.
+    ///
+    /// The report carries the tallies rather than the names, so nothing calls this
+    /// yet; it is kept (with the lint silenced, like `role_at`) because the log line
+    /// that wants it is a one-liner away and a name is better than a debug print.
+    #[allow(dead_code)]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            GateOutcome::Read { .. } => "read",
+            GateOutcome::Store { device: false, .. } => "store",
+            GateOutcome::Store { device: true, .. } => "device_write",
+            GateOutcome::Unobserved => "unobserved",
+        }
+    }
+}
+
+/// The instruction that produced a checksum observation, and the rule that fired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChecksumEvidence {
+    pub producer_pc: u64,
+    pub arm: ChecksumArm,
+    /// `None` when the event states a checksum; otherwise why it is recorded as
+    /// evidence only and must not produce a role.
+    pub rejection: Option<ChecksumRejection>,
+}
+
+/// Why a checksum-shaped event is evidence rather than a checksum.
+///
+/// Both rejections are the same mistake seen from two angles: the rule asks
+/// whether *two received values* were compared, and neither shape has two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ChecksumRejection {
+    /// Both operands are flag registers.  Every conditional branch lifts to a flag
+    /// *algebra* (`bgt` is `NG == OV`, `bls` is `CY == 0 || ZR == 1`), so the
+    /// comparison computes a condition out of one read's taint rather than
+    /// comparing data.  On the target this is `readline+0x23`'s `bgt`, once per
+    /// console byte.
+    Condition,
+    /// Both sides resolve to the *same* read (`width == 1`).  A checksum check
+    /// compares a received value with a computed or expected one; comparing a
+    /// value with itself (or with a copy of itself) states nothing.
+    SingleRead,
+}
+
+impl ChecksumRejection {
+    /// Stable name for the report.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ChecksumRejection::Condition => "condition",
+            ChecksumRejection::SingleRead => "single_read",
+        }
+    }
 }
 
 /// What is known about one (source, target) gating pair.
@@ -293,6 +471,17 @@ pub struct PhaseBEngine {
     /// Variables produced by mixing operations (xor/shift/multiply/non-constant
     /// and), i.e. candidates for a checksum accumulator.
     def_mixed: HashSet<VarId>,
+    /// Variables known to be a bit test of another value (see [`TestInfo`]), so a
+    /// branch on them can be reported as "bit `mask` is watched".
+    def_test: HashMap<VarId, TestInfo>,
+    /// Variables known to be a shift of another value, which the sign test below
+    /// turns back into the bit being watched.
+    def_shift: HashMap<VarId, (Value, u8, bool)>,
+    /// Bit tests whose consequence has not been seen yet.  Cleared when the pass
+    /// resets and when control leaves the function that made the test.
+    pending_gates: Vec<PendingGate>,
+    /// Bit tests reported, for the report's counter.
+    gate_tests: u64,
     /// Registers that hold a mixed value.  Unlike `def_mixed` this is scoped to
     /// the pass, not the block: a CRC accumulator is built inside a loop and
     /// compared after the loop has exited, in a different group, where the
@@ -363,6 +552,18 @@ pub struct PhaseBEngine {
     loads_interpreted: u64,
     skipped_space_ops: u64,
     stack_stores_skipped: u64,
+    /// Tainted stores that landed in a peripheral register rather than in memory
+    /// (`on_device_write`): the firmware driving its own device, not a role.
+    device_writes: u64,
+    /// Magic discriminants demoted to [`DEMOTED_CONFIDENCE`] as addresses or
+    /// offset boundaries (see `magic_confidence`).
+    demoted_discriminants: u64,
+    /// Discriminants that came from the literal-pool fallback in `report_compare`,
+    /// per comparison site (see `PhaseBCounters::pool_by_pc`).
+    pool_discriminants: u64,
+    pool_by_pc: BTreeMap<u64, u64>,
+    /// Demoted discriminants by reason, so the total can be argued from the parts.
+    demoted_by_reason: BTreeMap<&'static str, u64>,
     table_loads: u64,
     /// Times interpretation stopped part-way through a group while the CPU kept
     /// executing it (an unresolvable internal branch, or the step cap).  Each one
@@ -371,6 +572,28 @@ pub struct PhaseBEngine {
     /// Set when a panic in the taint hook forced the pass to disarm.
     panic_disarmed: bool,
     observer: Option<Box<dyn PhaseBObserver>>,
+}
+
+/// A value that is known to be a *bit test* of another value: `c & MASK`, or the
+/// sign of `c << k` / `c >> k`.
+///
+/// This is what lets a conditional branch be read as "the firmware watched bit
+/// `mask` of `source`" instead of "some taint reached a flag".
+#[derive(Debug, Clone, Copy)]
+struct TestInfo {
+    /// The bits the tested value keeps.
+    mask: u64,
+    /// The value under test.
+    source: Value,
+}
+
+/// A bit test whose consequence has not been seen yet.
+#[derive(Debug, Clone)]
+struct PendingGate {
+    sources: Vec<AccessContext>,
+    mask: u64,
+    branch_pc: u64,
+    outcome: GateOutcome,
 }
 
 /// How a variable was produced by an add/subtract, for magic backtracking.
@@ -403,6 +626,10 @@ impl PhaseBEngine {
             def_taint: HashMap::new(),
             def_sub: HashMap::new(),
             def_mixed: HashSet::new(),
+            def_test: HashMap::new(),
+            def_shift: HashMap::new(),
+            pending_gates: Vec::new(),
+            gate_tests: 0,
             mixed_regs: HashSet::new(),
             def_masked: HashMap::new(),
             flag_vars: HashSet::new(),
@@ -429,6 +656,9 @@ impl PhaseBEngine {
             stack_stores_skipped: 0,
             device_writes: 0,
             demoted_discriminants: 0,
+            pool_discriminants: 0,
+            pool_by_pc: BTreeMap::new(),
+            demoted_by_reason: BTreeMap::new(),
             table_loads: 0,
             early_stops: 0,
             panic_disarmed: false,
@@ -446,6 +676,12 @@ impl PhaseBEngine {
     ///
     /// Calling it twice with different streams makes the PC a multiplexed site,
     /// which the engine resolves per read by the concrete load address.
+    ///
+    /// This is the incremental form of `reset_pass`'s `read_sites` argument: the
+    /// analysis path hands the whole map over at once (it comes from the read
+    /// ledger), so the callers today are the tests and the lint is silenced here
+    /// rather than project-wide.
+    #[allow(dead_code)]
     pub fn pin_site(&mut self, pc: u64, stream: StreamKey) {
         let streams = self.read_sites.entry(pc).or_default();
         if !streams.contains(&stream) {
@@ -512,6 +748,12 @@ impl PhaseBEngine {
         self.def_taint.clear();
         self.def_sub.clear();
         self.def_mixed.clear();
+        self.def_test.clear();
+        self.def_shift.clear();
+        // A pending bit test belongs to one pass: it is evidence about the code
+        // that ran, and it must not survive into the next one.
+        self.pending_gates.clear();
+        self.gate_tests = 0;
         self.mixed_regs.clear();
         self.def_masked.clear();
         self.table_load_in_block = false;
@@ -530,6 +772,9 @@ impl PhaseBEngine {
         self.loads_interpreted = 0;
         self.device_writes = 0;
         self.demoted_discriminants = 0;
+        self.pool_discriminants = 0;
+        self.pool_by_pc.clear();
+        self.demoted_by_reason.clear();
     }
 
     /// Concrete value of an input, consulting in-block defs first, then `env`.
@@ -605,6 +850,8 @@ impl PhaseBEngine {
         // subtraction or mask.
         self.def_masked.remove(&out.id);
         self.def_sub.remove(&out.id);
+        self.def_test.remove(&out.id);
+        self.def_shift.remove(&out.id);
         if out.id > 0 {
             self.mixed_regs.remove(&out.id);
         }
@@ -637,6 +884,70 @@ impl PhaseBEngine {
         }
     }
 
+    /// The bit(s) a sign test on `v` actually watches.
+    ///
+    /// The value is either a mask (`c & 0x20`: the mask itself), a shift (`c << 7`
+    /// tests bit 0, `c >> 4` tests the top four bits), or a plain value, whose sign
+    /// bit is the top bit of its width.
+    fn tested_mask(&self, v: Value, size: u8) -> Option<(u64, Value)> {
+        if let Value::Var(vn) = v {
+            if let Some(test) = self.def_test.get(&vn.id) {
+                return Some((test.mask, test.source));
+            }
+            if let Some((source, amount, left)) = self.def_shift.get(&vn.id).copied() {
+                let bits = u32::from(size.max(1)) * 8;
+                if left {
+                    // `c << k` puts bit `bits - 1 - k` of `c` into the sign.
+                    let bit = bits.saturating_sub(1 + u32::from(amount));
+                    return Some((1u64 << bit.min(63), source));
+                }
+                // `c >> k` (logical) puts bits [k, bits) of `c` into the sign,
+                // which the sign test reads as "any of them set".
+                let low = u32::from(amount).min(63);
+                let width = bits.saturating_sub(low).min(64 - low);
+                let mask = if width >= 64 { u64::MAX } else { ((1u64 << width) - 1) << low };
+                return Some((mask, source));
+            }
+        }
+        // The sign bit of a *plain* value is a bit of that value; the sign bit of
+        // a derived one is not.  `cmp r0, #0xd` signs `r0 - 0xd`, so reporting
+        // "bit 31 of the input byte" for the branch that follows would state a
+        // constraint that does not exist -- what that branch is about is the
+        // comparison against 0xd, which is the magic rule's job.  The mask has to
+        // come from a mask or a shift on the value, or not be reported at all.
+        if let Value::Var(vn) = v {
+            let derived = self.def_sub.contains_key(&vn.id)
+                || self.def_masked.contains_key(&vn.id)
+                || self.def_mixed.contains(&vn.id)
+                || self.mixed_regs.contains(&vn.id);
+            if derived {
+                return None;
+            }
+        }
+        let bits = u32::from(size.max(1)) * 8;
+        Some((1u64 << bits.saturating_sub(1).min(63), v))
+    }
+
+    /// Close every bit test still waiting for its consequence.
+    ///
+    /// The attribution window is the function the test belongs to (the decision
+    /// recorded with the recipe): a call or a return leaves it, and so does the end
+    /// of the pass.  A test whose consequence never showed up inside the window is
+    /// reported as `Unobserved` -- it is a sample that did not confirm the gate,
+    /// not one that was guessed at.
+    fn flush_gate_tests(&mut self) {
+        if self.pending_gates.is_empty() {
+            return;
+        }
+        let gates: Vec<PendingGate> = self.pending_gates.drain(..).collect();
+        self.gate_tests += gates.len() as u64;
+        for gate in gates {
+            if let Some(observer) = self.observer.as_mut() {
+                observer.on_gate_test(&gate.sources, gate.mask, gate.branch_pc, gate.outcome);
+            }
+        }
+    }
+
     fn contexts_of(&self, tag: &TaintTag) -> Vec<AccessContext> {
         self.shadow.index.contexts_in_tag(tag)
     }
@@ -665,6 +976,8 @@ impl PhaseBEngine {
     /// Called after the run: the number of target reads is only complete once
     /// execution has finished.
     pub fn emit_observations(&mut self) {
+        // The pass is over: whatever a gate was still waiting for never happened.
+        self.flush_gate_tests();
         let mut events: Vec<(AccessContext, Vec<u32>, AccessContext, u64, Vec<AccessContext>)> =
             Vec::new();
         for (&(source, target), obs) in &self.ctrl_obs {
@@ -714,8 +1027,12 @@ impl PhaseBEngine {
             stack_stores_skipped: self.stack_stores_skipped,
             device_writes: self.device_writes,
             demoted_discriminants: self.demoted_discriminants,
+            demoted_by_reason: self.demoted_by_reason.iter().map(|(k, v)| (*k, *v)).collect(),
+            pool_discriminants: self.pool_discriminants,
+            pool_by_pc: self.pool_by_pc.iter().map(|(k, v)| (*k, *v)).collect(),
             table_loads: self.table_loads,
             early_stops: self.early_stops,
+            gate_tests: self.gate_tests,
             panic_disarmed: self.panic_disarmed,
             evictions: self.shadow.evictions(),
         }
@@ -817,6 +1134,11 @@ impl PhaseBEngine {
         self.def_sub.clear();
         self.def_mixed.clear();
         self.def_masked.clear();
+        // Block-local like the rest: a *register* can carry a stale bit test into
+        // the next block otherwise, and a mask from a block that has nothing to do
+        // with this one would turn a plain branch into a reported gate.
+        self.def_test.clear();
+        self.def_shift.clear();
         self.cur_pc = start;
         self.cur_group_entry = start;
 
@@ -932,6 +1254,17 @@ impl PhaseBEngine {
                         *counter += 1;
                         let ctx = AccessContext::at(self.cur_pc, key, *counter as u32);
 
+                        // The first read the gated code performs is what the gate
+                        // bought -- unless it is the gated value's own read, which is
+                        // the gate polling itself rather than consuming anything new.
+                        for gate in self.pending_gates.iter_mut() {
+                            if gate.outcome == GateOutcome::Unobserved
+                                && !gate.sources.iter().any(|s| s.pc == ctx.pc && s.addr == ctx.addr)
+                            {
+                                gate.outcome = GateOutcome::Read { pc: ctx.pc, addr: ctx.addr };
+                            }
+                        }
+
                         // A tainted loop gate seen earlier bounds how much of this
                         // stream is consumed.  Only loop gates reach `gating` (see
                         // the exit handling), so every entry here is a real bound.
@@ -1016,6 +1349,16 @@ impl PhaseBEngine {
                     let size = value_size(stmt.inputs.second()).max(1);
                     let addr = self.concrete_in(stmt.inputs.first(), env);
                     if let Some(a) = addr {
+                        let device = self.is_device_address(a);
+                        // A store while a gate is pending is what the gate was for:
+                        // into memory it is consumption, into a peripheral register
+                        // it is the firmware serving itself (the weak case).
+                        for gate in self.pending_gates.iter_mut() {
+                            if gate.outcome == GateOutcome::Unobserved {
+                                gate.outcome =
+                                    GateOutcome::Store { pc: self.cur_pc, device };
+                            }
+                        }
                         let val_tag = self.taint_in(stmt.inputs.second());
                         let addr_tag = self.taint_in(stmt.inputs.first());
                         let tag = val_tag.union(&addr_tag);
@@ -1053,16 +1396,30 @@ impl PhaseBEngine {
                                     // copy: the sink's role would be wrong.
                                     let confidence =
                                         if self.table_load_in_block { 0.7 } else { 0.6 };
+                                    let arm = if self.table_load_in_block {
+                                        ChecksumArm::StoreMixedAfterTableLoad
+                                    }
+                                    else {
+                                        ChecksumArm::StoreMixed
+                                    };
+                                    let producer_pc = self.cur_pc;
                                     if let Some(observer) = self.observer.as_mut() {
-                                        observer.on_checksum(&sources, confidence);
+                                        observer.on_checksum(
+                                            &sources,
+                                            confidence,
+                                            ChecksumEvidence { producer_pc, arm, rejection: None },
+                                        );
                                     }
                                 }
                                 else {
-                                    let value =
-                                        self.concrete_in(stmt.inputs.second(), env).unwrap_or(0);
+                                    let concrete = self.concrete_in(stmt.inputs.second(), env);
+                                    let value = concrete.unwrap_or(0);
+                                    let value_known = concrete.is_some();
                                     let pc = self.cur_pc;
                                     if let Some(observer) = self.observer.as_mut() {
-                                        observer.on_tainted_store(&sources, pc, a, size, value);
+                                        observer.on_tainted_store(
+                                            &sources, pc, a, size, value, value_known,
+                                        );
                                     }
                                 }
                             }
@@ -1073,6 +1430,14 @@ impl PhaseBEngine {
                 Op::Copy | Op::ZeroExtend | Op::SignExtend => {
                     let src = stmt.inputs.first();
                     let c = self.concrete_in(src, env);
+                    // A copy of a tested value is still that test: the flag
+                    // plumbing between the comparison and the branch is full of
+                    // them, and losing the mask here would lose the gate.
+                    if let Value::Var(vn) = src {
+                        if let Some(test) = self.def_test.get(&vn.id).copied() {
+                            self.def_test.insert(stmt.output.id, test);
+                        }
+                    }
                     let t = self.taint_in(src);
                     self.set_def(stmt.output, c, t);
 
@@ -1159,7 +1524,16 @@ impl PhaseBEngine {
                         if stmt.op == Op::IntAnd && mask.is_some() {
                             // `value & mask` extracts bits: the result is a
                             // position test, not the value the firmware compares.
-                            self.def_masked.insert(stmt.output.id, mask.expect("checked"));
+                            let mask = mask.expect("checked");
+                            self.def_masked.insert(stmt.output.id, mask);
+                            // ... and it is *the* shape of a bit test: remember which
+                            // value's bits these are, so a branch on the result can
+                            // be reported as "the firmware watched bit `mask`".
+                            let source = match (a, b) {
+                                (s, Value::Const(..)) | (Value::Const(..), s) => s,
+                                _ => Value::Const(0, 1),
+                            };
+                            self.def_test.insert(stmt.output.id, TestInfo { mask, source });
                             // A mask does not undo a mixing chain, though: the final
                             // `crc & 0xFFFF` before a comparison is still a checksum.
                             // Only an *already mixed* operand propagates here --
@@ -1190,6 +1564,28 @@ impl PhaseBEngine {
                         }
                         else {
                             self.note_mixed(stmt.output, false);
+                            // A shift on its own is not a test, but a *sign* test on
+                            // the result is: record it so `x << 7 < 0` can be read as
+                            // "bit 0 of x", and `x >> 4` as "the top four bits".
+                            if matches!(stmt.op, Op::IntLeft | Op::IntRight | Op::IntSignedRight)
+                            {
+                                if let Some(amount) = constant_of(a).or_else(|| constant_of(b)) {
+                                    let source = match (a, b) {
+                                        (s, Value::Const(..)) | (Value::Const(..), s) => s,
+                                        _ => Value::Const(0, 1),
+                                    };
+                                    if !source.is_invalid() {
+                                        let left = stmt.op == Op::IntLeft;
+                                        let bits = stmt.output.size.max(1) * 8;
+                                        if amount < u64::from(bits) {
+                                            self.def_shift.insert(
+                                                stmt.output.id,
+                                                (source, amount as u8, left),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1219,12 +1615,43 @@ impl PhaseBEngine {
                         // lifted output (ARM `cmp r,r` becomes subtract-and-test,
                         // which the backtrack path covers), but when it does occur
                         // it is an echo or a verification, never a constant.
-                        (Value::Var(_), Value::Var(_))
+                        //
+                        // Flags are excluded, and on the target that exclusion is
+                        // the whole rule: every conditional branch lifts to a
+                        // *flag algebra* (`bgt` is `NG == OV`, `bls` is
+                        // `CY == 0 || ZR == 1`), so a comparison between two flags
+                        // says nothing about the data even though both flags carry
+                        // the taint of the read they were computed from.  Without
+                        // this, one `bgt` on an input byte reports that byte as
+                        // checksum input -- the target's `readline+0x23` did it
+                        // 132 times, once per console byte, at width 1 (both sides
+                        // resolving to the same read).
+                        (Value::Var(a_vn), Value::Var(b_vn))
                             if !ta.is_clean() && !tb.is_clean() =>
                         {
                             let sources = self.contexts_of(&ta.union(&tb));
+                            let producer_pc = self.cur_pc;
+                            let rejection = if self.flag_vars.contains(&a_vn.id)
+                                || self.flag_vars.contains(&b_vn.id)
+                            {
+                                Some(ChecksumRejection::Condition)
+                            }
+                            else if sources.len() < 2 {
+                                Some(ChecksumRejection::SingleRead)
+                            }
+                            else {
+                                None
+                            };
                             if let Some(observer) = self.observer.as_mut() {
-                                observer.on_checksum(&sources, 0.5);
+                                observer.on_checksum(
+                                    &sources,
+                                    0.5,
+                                    ChecksumEvidence {
+                                        producer_pc,
+                                        arm: ChecksumArm::EqualBothTainted,
+                                        rejection,
+                                    },
+                                );
                             }
                         }
                         _ => {}
@@ -1261,6 +1688,27 @@ impl PhaseBEngine {
                         _ => None,
                     };
                     self.set_def(stmt.output, c, ta.union(&tb));
+                    // A *signed* comparison against zero is a sign test, i.e. a test
+                    // of the top bit of its operand -- and when that operand is a
+                    // shift, of the bit the shift moved up.  That is the whole gate:
+                    // `c << 7 < 0` is `c & 1`, `c >> 4 == 0` is the top four bits,
+                    // and `ISR & 0x20` reaches here as a sign test on the masked
+                    // value.  Only the sign forms qualify: an *unsigned* `< 0` is a
+                    // zero test, not a bit.
+                    //
+                    // After `set_def`, which resets the derivation notes for its
+                    // output: recording the test before it would be wiped by it.
+                    if stmt.op == Op::IntSignedLess && !stmt.output.is_invalid() {
+                        let mask = match b {
+                            Value::Const(0, _) => self.tested_mask(a, size),
+                            _ => None,
+                        };
+                        if let Some((mask, source)) = mask {
+                            if mask != 0 {
+                                self.def_test.insert(stmt.output.id, TestInfo { mask, source });
+                            }
+                        }
+                    }
                 }
 
                 Op::IntDiv | Op::IntSignedDiv | Op::IntRem | Op::IntSignedRem
@@ -1347,6 +1795,22 @@ impl PhaseBEngine {
                 // gates a decision, and the fact that it was reached twice says
                 // nothing about how much input is consumed.
                 if !cond_tag.is_clean() {
+                    // A condition that came out of a bit test says *which bit* the
+                    // firmware watched.  That is the constraint the mutator needs
+                    // (do not randomise the bit the code branches on); whether it is
+                    // worth stating depends on what the gate buys, which the
+                    // following code decides.
+                    if let Some(test) = self.def_test.get(&cond.id).copied() {
+                        let sources = self.contexts_of(&cond_tag);
+                        if !sources.is_empty() {
+                            self.pending_gates.push(PendingGate {
+                                sources,
+                                mask: test.mask,
+                                branch_pc: self.cur_pc,
+                                outcome: GateOutcome::Unobserved,
+                            });
+                        }
+                    }
                     let branch_pc = self.cur_pc;
                     if let Some(loops_back) = self.branch_loops_back(block, cond, env) {
                         if loops_back {
@@ -1379,6 +1843,22 @@ impl PhaseBEngine {
                     }
                 }
             }
+        }
+
+        // The attribution window ends when this block leaves the function (a call
+        // or a return): whatever runs next is not this gate's consequence.
+        self.close_gate_window(&block.exit);
+    }
+
+    /// Close the bit tests still open when control leaves this function.
+    ///
+    /// The window is "the same function" (the decision recorded with the recipe):
+    /// the moment a call or a return transfers control elsewhere, a pending test is
+    /// no longer evidence about *this* function's gating, so it is reported as
+    /// unobserved rather than attributed to whatever runs next.
+    fn close_gate_window(&mut self, exit: &BlockExit) {
+        if matches!(exit, BlockExit::Call { .. } | BlockExit::Return { .. }) {
+            self.flush_gate_tests();
         }
     }
 
@@ -1483,14 +1963,23 @@ impl PhaseBEngine {
             // the whole mixing chain as magic would be wrong.
             if self.operand_mixed(var) {
                 let sources = self.contexts_of(&tag);
+                let producer_pc = self.cur_pc;
                 if let Some(observer) = self.observer.as_mut() {
-                    observer.on_checksum(&sources, 0.6);
+                    observer.on_checksum(
+                        &sources,
+                        0.6,
+                        ChecksumEvidence {
+                            producer_pc,
+                            arm: ChecksumArm::CompareMixedDirect,
+                            rejection: None,
+                        },
+                    );
                 }
                 return;
             }
             let sources = self.contexts_of(&tag);
-            let confidence = self.magic_confidence(var, constant, 0.85);
-            self.emit_magic(sources, constant, confidence, var_from_fallback);
+            let confidence = self.magic_confidence(var, constant, value_size(var), false, 0.85);
+            self.emit_magic(sources, constant, confidence, var_from_fallback, false);
             return;
         }
 
@@ -1516,8 +2005,17 @@ impl PhaseBEngine {
         // check -- including the hard-coded variant `tmp = crc - 0x1234; tmp == 0`.
         if self.operand_mixed(info.base) {
             let sources = self.contexts_of(&base_tag);
+            let producer_pc = self.cur_pc;
             if let Some(observer) = self.observer.as_mut() {
-                observer.on_checksum(&sources, 0.6);
+                observer.on_checksum(
+                    &sources,
+                    0.6,
+                    ChecksumEvidence {
+                        producer_pc,
+                        arm: ChecksumArm::CompareMixedBacktrack,
+                        rejection: None,
+                    },
+                );
             }
             return;
         }
@@ -1531,6 +2029,22 @@ impl PhaseBEngine {
         // is the base operand itself (there is no second operand), so testing it
         // unconditionally would reject every real `cmp r, #imm` -- the single
         // most valuable shape this rule exists to catch.
+        //
+        // Whether the value below came from the literal-pool fallback.  The
+        // comparison states no immediate in that shape, so the "constant" is
+        // whatever the other operand happened to hold: a real event, but a
+        // weaker claim than an encoded immediate, so it is counted and flagged
+        // (`MagicEvidence::from_pool`) rather than mixed in silently.
+        //
+        // DEFERRED POLICY NOTE -- do not "fix" this path by capping every
+        // `from_pool` event: the fallback has *true positives*.  On the target the
+        // shell's `strcmp` byte comparison reads its character out of the literal
+        // pool, and this arm is what recovers the command-name discriminants
+        // (`0x6c`/`0x6d`/`0x70`/`0x73`) that the input has to match.  A blanket
+        // cap (or a blanket demotion) would delete real contracts.  Any policy
+        // here must be decided per comparison point -- by `compare_pc`, which is
+        // exactly what `MagicSite::compare_pc` / `from_pool` exist to allow.
+        let mut from_pool = false;
         let (value, confidence) = match info.constant {
             Some(c) => (c, 0.85),
             None => {
@@ -1541,13 +2055,36 @@ impl PhaseBEngine {
                 let other_tag = self.taint_in(info.other);
                 if !other_tag.is_clean() {
                     let sources = self.contexts_of(&base_tag.union(&other_tag));
+                    let producer_pc = self.cur_pc;
+                    // Two received values were compared only if the two sides are
+                    // two reads; one read on both sides is a value compared with a
+                    // copy of itself, which states nothing about the input.
+                    let rejection =
+                        if sources.len() < 2 { Some(ChecksumRejection::SingleRead) } else { None };
                     if let Some(observer) = self.observer.as_mut() {
-                        observer.on_checksum(&sources, 0.5);
+                        observer.on_checksum(
+                            &sources,
+                            0.5,
+                            ChecksumEvidence {
+                                producer_pc,
+                                arm: ChecksumArm::CompareOtherTainted,
+                                rejection,
+                            },
+                        );
                     }
                     return;
                 }
                 match self.concrete_in(info.other, env) {
-                    Some(c) => (c, 0.6),
+                    Some(c) => {
+                        self.pool_discriminants += 1;
+                        // Per comparison site: this is the attribution the
+                        // per-site policy needs (which of the pooled comparisons
+                        // are hardware-register assertions, which are command
+                        // names).  A total cannot be judged, a site can.
+                        *self.pool_by_pc.entry(self.cur_pc).or_insert(0) += 1;
+                        from_pool = true;
+                        (c, 0.6)
+                    }
                     None => return,
                 }
             }
@@ -1559,9 +2096,23 @@ impl PhaseBEngine {
         let width = value_size(info.base).max(value_size(info.other));
         let value = mask_to_size(value, width);
         let value = if info.is_add { mask_to_size(value.wrapping_neg(), width) } else { value };
+        // A value recovered from the literal pool is kept unless its comparison
+        // site has been judged individually (see `POOL_DISCRIMINANT_ALLOWLIST`).
+        // The rule is deliberately per site and deliberately empty: the fallback
+        // has true positives -- the shell's `strcmp` recovers the command-name
+        // comparisons from the pool -- so a blanket rule would delete contracts.
+        let mut confidence = confidence;
+        if from_pool {
+            let mixed = self.operand_mixed(info.base);
+            if let Some(reason) = pool_demotion(self.cur_pc, mixed) {
+                self.demoted_discriminants += 1;
+                *self.demoted_by_reason.entry(reason).or_insert(0) += 1;
+                confidence = DEMOTED_CONFIDENCE;
+            }
+        }
         let sources = self.contexts_of(&base_tag);
-        let confidence = self.magic_confidence(info.base, value, confidence);
-        self.emit_magic(sources, value, confidence, base_from_fallback);
+        let confidence = self.magic_confidence(info.base, value, width, info.is_add, confidence);
+        self.emit_magic(sources, value, confidence, base_from_fallback, from_pool);
     }
 
     /// The confidence a discriminant deserves, after rejecting the values that are
@@ -1574,13 +2125,47 @@ impl PhaseBEngine {
     /// compared value is an *offset* of (`c + 1 == 0xe`, where the firmware is
     /// bounding a derived value).  Both stay in the evidence, at a confidence below
     /// the mutation threshold.
-    fn magic_confidence(&mut self, var: Value, value: u64, confidence: f32) -> f32 {
+    ///
+    /// `width` is the width the comparison itself used: a negative artifact is a
+    /// run of high one-bits of that width (`-1` is `0xff` at one byte, `0xffff` at
+    /// two, `0xffff_ffff` at four), so the shape has to be measured there rather
+    /// than at a fixed four bytes.
+    fn magic_confidence(
+        &mut self,
+        var: Value,
+        value: u64,
+        width: u8,
+        negated_add_form: bool,
+        confidence: f32,
+    ) -> f32 {
         let offset_base = match var {
             Value::Var(vn) => self.def_sub.contains_key(&vn.id),
             _ => false,
         };
-        if looks_like_address(value) || offset_base {
+        // The value's shape is checked before the derivation rule: a reader can
+        // verify a shape against the disassembly, and the offset rule catches what
+        // the shapes do not (`c + 1 == 0xe`, whose 0x0e is neither an address nor a
+        // negation).
+        let reason = if is_negative_artifact(value, width) {
+            Some(if negated_add_form {
+                DemotionReason::NegatedAddForm
+            }
+            else {
+                DemotionReason::OnesAtWidth
+            })
+        }
+        else if looks_like_address(value, width) {
+            Some(DemotionReason::AddressShape)
+        }
+        else if offset_base {
+            Some(DemotionReason::OffsetBase)
+        }
+        else {
+            None
+        };
+        if let Some(reason) = reason {
             self.demoted_discriminants += 1;
+            *self.demoted_by_reason.entry(reason.as_str()).or_insert(0) += 1;
             return DEMOTED_CONFIDENCE;
         }
         confidence
@@ -1593,6 +2178,7 @@ impl PhaseBEngine {
         value: u64,
         confidence: f32,
         from_fallback: bool,
+        from_pool: bool,
     ) {
         let compare_pc = self.cur_pc;
         if let Some(observer) = self.observer.as_mut() {
@@ -1600,7 +2186,7 @@ impl PhaseBEngine {
                 &sources,
                 value,
                 confidence,
-                MagicEvidence { compare_pc, from_fallback },
+                MagicEvidence { compare_pc, from_fallback, from_pool },
             );
         }
     }
@@ -1612,14 +2198,93 @@ impl PhaseBEngine {
 /// the evidence survives and the role does not.
 const DEMOTED_CONFIDENCE: f32 = 0.3;
 
+/// Why a discriminant was demoted to evidence-only.
+///
+/// The total alone cannot carry the argument: "427 demoted" mixes four different
+/// mechanisms, and the paper has to say which one dominates.  The split is by the
+/// *shape of the stated value* first (a negative artifact, a pointer) and by the
+/// derivation rule last (a boundary of a value derived from the input), because
+/// the value's shape is what a reader can check against the disassembly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DemotionReason {
+    /// The add form states its constant negated (`cmn r0, #1` is `r0 + 1 == 0`),
+    /// and that negation came out as a run of one-bits.
+    NegatedAddForm,
+    /// A run of one-bits at the width the comparison used, without the add form:
+    /// `-0x400` masked to four bytes, `-1` masked to two.
+    OnesAtWidth,
+    /// The value lands in a Cortex-M memory segment: the comparison is against a
+    /// pointer, reached by input taint through the scheduler.
+    AddressShape,
+    /// The compared value is an *offset* of the input (`c + 1 == 0xe`): the
+    /// firmware is bounding a derived value, so the stated constant is a boundary
+    /// rather than a value the input should take.
+    OffsetBase,
+}
+
+impl DemotionReason {
+    /// Stable name for the report.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            DemotionReason::NegatedAddForm => "negated_add_form",
+            DemotionReason::OnesAtWidth => "ones_at_width",
+            DemotionReason::AddressShape => "address_shape",
+            DemotionReason::OffsetBase => "offset_base",
+        }
+    }
+}
+
+/// The Cortex-M memory map, as half-open `(start, end)` ranges.
+///
+/// Check this table before reusing the pass on another architecture family: it is
+/// the *generic* Cortex-M map, not something read out of this firmware's linker
+/// script.
+///
+/// The SRAM range deliberately stops at 0x2008_0000 (512 KiB) instead of running
+/// on to the peripheral block.  A wider range would swallow four-byte protocol
+/// constants that merely start with `0x2000`, and misreading a real magic value as
+/// an address loses a contract, which costs more than letting an address through:
+/// the false negative is unrecoverable, the false positive is not (the event stays
+/// in `magic_sites` either way, but a lost role is simply gone).
+const SEGMENTS: [(u64, u64); 4] = [
+    (0x0800_0000, 0x1000_0000), // code / literal pool
+    (0x2000_0000, 0x2008_0000), // SRAM
+    (0x4000_0000, 0x6000_0000), // peripherals
+    (0xE000_0000, 0xF000_0000), // system PPB
+];
+
 /// Whether a constant is really an address.
 ///
-/// Calibrated on the target: the lowest code address is 0x0800_0000, and the range
-/// covers SRAM (0x2000_xxxx), peripherals (0x4000_xxxx) and the NVIC
-/// (0xE000_xxxx).  Pointers are *stable across seeds*, which is exactly why a
-/// cross-seed filter cannot see them, so they are rejected on their shape.
-fn looks_like_address(v: u64) -> bool {
-    v >= 0x0800_0000
+/// Two classes, both of which the target produced:
+///
+///  * a negative value masked back to the width of the comparison.  `cmn r3, #1`
+///    is `r3 + 1 == 0` and states `0xff..ff`; a bound check on `r4 - 0x400` states
+///    `0xffff_fc00`.  Measured at four bytes a 16-bit `-1` (`0xffff`) would slip
+///    through, so the run of one-bits is checked at the width actually used.
+///  * a pointer into the [memory map](SEGMENTS).  Pointers are *stable across
+///    seeds*, which is exactly why a cross-seed filter cannot see them, so they are
+///    rejected on their shape instead.
+///
+/// Both classes stay in the evidence (`magic_sites`) at
+/// [`DEMOTED_CONFIDENCE`]; only the role is withheld.
+fn looks_like_address(v: u64, width: u8) -> bool {
+    is_negative_artifact(v, width) || SEGMENTS.iter().any(|(start, end)| v >= *start && v < *end)
+}
+
+/// Whether `v` is a negative value of `width` bytes that survived masking.
+///
+/// The width decides the shape: the high two bytes for anything two bytes or
+/// wider (that is where the mask leaves its run of one-bits), the whole value for
+/// a single byte, which has no high half to inspect.
+fn is_negative_artifact(v: u64, width: u8) -> bool {
+    match width {
+        0 | 1 => v == 0xff,
+        2 => v == 0xffff,
+        _ => {
+            let shift = (u32::from(width) * 8 - 16).min(48);
+            (v >> shift) & 0xffff == 0xffff
+        }
+    }
 }
 
 /// Whether an operation *creates* a mixing chain out of tainted data.
@@ -1629,6 +2294,42 @@ fn looks_like_address(v: u64) -> bool {
 /// two values together do create one.
 fn creates_mixing(op: Op) -> bool {
     matches!(op, Op::IntXor | Op::IntMul | Op::IntRight | Op::IntSignedRight)
+}
+
+
+/// Comparison sites whose literal-pool discriminants have been *judged* to be
+/// contracts, each with the reason it was accepted.
+///
+/// **Empty on purpose, and it must stay that way unless a site is judged on its
+/// own.**  The fallback has true positives: on the target, `strcmp`'s byte
+/// comparison reads its character from the pool, and that is how the command-name
+/// discriminants (`0x6c`/`0x6d`/`0x70`/`0x73`) are recovered.  A blanket rule over
+/// `from_pool` would delete real contracts, so the policy is per `compare_pc` and
+/// every entry carries the evidence that justified it -- a hardware-register
+/// assertion, a configuration check, or a real command comparison.
+const POOL_DISCRIMINANT_ALLOWLIST: &[(u64, &'static str)] = &[];
+
+/// Whether a pooled discriminant at `pc` should be demoted, and the reason.
+///
+/// Mixed evidence wins: a value that also went through a mixing chain is a real
+/// accumulator being finalised, and no pool heuristic applies to it.  With the
+/// allow-list empty nothing is demoted, which is the correct state until a site is
+/// judged -- `pool_discriminants`' per-`pc` histogram is what such a judgement is
+/// made from.
+fn pool_demotion_in(
+    allowlist: &[(u64, &'static str)],
+    pc: u64,
+    mixed: bool,
+) -> Option<&'static str> {
+    if mixed {
+        return None;
+    }
+    allowlist.iter().find(|(site, _)| *site == pc).map(|(_, why)| *why)
+}
+
+/// The live policy: see [`POOL_DISCRIMINANT_ALLOWLIST`].
+fn pool_demotion(pc: u64, mixed: bool) -> Option<&'static str> {
+    pool_demotion_in(POOL_DISCRIMINANT_ALLOWLIST, pc, mixed)
 }
 
 fn value_size(v: Value) -> u8 {
@@ -1680,7 +2381,9 @@ fn default_stack_window_up() -> u64 {
 }
 
 /// Machine-level totals for the analysis report.
-#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+// Not `Copy`: the per-reason and per-site breakdowns are vectors.  Nothing needs
+// to duplicate the struct, only to read its fields.
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct PhaseBCounters {
     /// Loads interpreted at a known MMIO read site.
     pub loads_interpreted: u64,
@@ -1694,10 +2397,26 @@ pub struct PhaseBCounters {
     /// derived from the input.  Reported so a run can be read without mistaking
     /// them for protocol constants.
     pub demoted_discriminants: u64,
+    /// The same total, split by why each discriminant was demoted.  Ordered by
+    /// name so two runs print identically.
+    pub demoted_by_reason: Vec<(&'static str, u64)>,
+    /// Discriminants recovered from the literal-pool fallback: the comparison had
+    /// no constant operand, so the value was taken from whatever the other
+    /// operand concretely held.  An open path -- it is how `cmp r1, r2` against a
+    /// loaded pool constant is read -- and the count says how much of the magic
+    /// role map rests on it.  `MagicEvidence::from_pool` names the same events
+    /// per comparison point.
+    pub pool_discriminants: u64,
+    /// ... and at which comparison site each came from: the attribution the
+    /// per-site allow-list policy needs, and the only way to tell a hardware
+    /// register assertion from a command-name comparison without re-running.
+    pub pool_by_pc: Vec<(u64, u64)>,
     /// Loads whose address was tainted (table lookups).
     pub table_loads: u64,
     /// Groups where interpretation stopped part-way (see `PhaseBEngine`).
     pub early_stops: u64,
+    /// Bit tests on input-derived data that gated subsequent code.
+    pub gate_tests: u64,
     /// Whether a panic forced the pass to disarm.
     pub panic_disarmed: bool,
     /// Bytes dropped from the shadow memory because it hit its bound.  Non-zero
@@ -2030,10 +2749,22 @@ mod tests {
     #[derive(Default)]
     struct Recorded {
         loads: Vec<(AccessContext, u8)>,
-        stores: Vec<(Vec<AccessContext>, u64, u64, u8, u64)>,
+        stores: Vec<(Vec<AccessContext>, u64, u64, u8, u64, bool)>,
         magics: Vec<(Vec<AccessContext>, u64, f32)>,
+        /// The evidence side of each magic event, kept separately so the
+        /// assertions above stay about the value and the tests that care about
+        /// provenance can read the flags.
+        magic_evidence: Vec<MagicEvidence>,
         loop_bounds: Vec<(AccessContext, Vec<u32>, AccessContext, u64, u64)>,
-        checksums: Vec<(Vec<AccessContext>, f32)>,
+            checksums: Vec<(Vec<AccessContext>, f32)>,
+        /// Which rule and instruction each checksum event came from, in the same
+        /// order as `checksums`.
+        checksum_arms: Vec<ChecksumArm>,
+        /// The refusal reason of each event, parallel to `checksums`: `None` when
+        /// it stated a checksum, `Some(..)` when it is evidence only.
+        checksum_rejections: Vec<Option<ChecksumRejection>>,
+        /// Bit tests, with the bit and what the gated code did.
+        gates: Vec<(Vec<AccessContext>, u64, u64, GateOutcome)>,
         table_loads: usize,
     }
 
@@ -2060,11 +2791,12 @@ mod tests {
             addr: u64,
             size: u8,
             value: u64,
+            value_known: bool,
         ) {
             self.recorded
                 .borrow_mut()
                 .stores
-                .push((sources.to_vec(), pc, addr, size, value));
+                .push((sources.to_vec(), pc, addr, size, value, value_known));
         }
 
         fn on_magic_compare(
@@ -2072,12 +2804,13 @@ mod tests {
             sources: &[AccessContext],
             value: u64,
             confidence: f32,
-            _evidence: MagicEvidence,
+            evidence: MagicEvidence,
         ) {
             self.recorded
                 .borrow_mut()
                 .magics
                 .push((sources.to_vec(), value, confidence));
+            self.recorded.borrow_mut().magic_evidence.push(evidence);
         }
 
         fn on_loop_bound(
@@ -2094,8 +2827,31 @@ mod tests {
                 .push((source, source_occs.to_vec(), target, count, gated_count));
         }
 
-        fn on_checksum(&mut self, sources: &[AccessContext], confidence: f32) {
+        fn on_checksum(
+            &mut self,
+            sources: &[AccessContext],
+            confidence: f32,
+            evidence: ChecksumEvidence,
+        ) {
             self.recorded.borrow_mut().checksums.push((sources.to_vec(), confidence));
+            {
+                let mut recorded = self.recorded.borrow_mut();
+                recorded.checksum_arms.push(evidence.arm);
+                recorded.checksum_rejections.push(evidence.rejection);
+            }
+        }
+
+        fn on_gate_test(
+            &mut self,
+            sources: &[AccessContext],
+            mask: u64,
+            branch_pc: u64,
+            outcome: GateOutcome,
+        ) {
+            self.recorded
+                .borrow_mut()
+                .gates
+                .push((sources.to_vec(), mask, branch_pc, outcome));
         }
 
         fn on_table_load(&mut self, _addr_sources: &[AccessContext], _pc: u64) {
@@ -2193,7 +2949,14 @@ mod tests {
         let mut env = MockEnv::new();
         env.regs.insert(5, 0x5800_0000);
         env.regs.insert(6, 0x2000_0000);
-        env.regs.insert(10, 0xdead_beef);
+        // The byte the load reads.  The stored value has to come from here, not
+        // from `regs`: the load defines r10 *in this block*, so the interpreter
+        // knows r10 is "whatever the input byte was" and must not answer from a
+        // stale environment value.  (Serving it from `regs` would have asserted a
+        // value the engine can never know: an MMIO read's value is unknown to the
+        // interpreter by design -- `LiveEnv::read_mem` refuses MMIO precisely so a
+        // read cannot consume fuzz bytes twice.)
+        env.mem.insert(0x5800_0000, 0xdead_beef);
 
         let (observer, recorded) = Recorder::new();
         e.set_observer(Box::new(observer));
@@ -2202,12 +2965,13 @@ mod tests {
         let recorded = recorded.borrow();
         let source = AccessContext::new(0x100, 0x5800_0000);
         assert_eq!(recorded.stores.len(), 1, "exactly one tainted store must be reported");
-        let (sources, pc, addr, size, value) = &recorded.stores[0];
+        let (sources, pc, addr, size, value, value_known) = &recorded.stores[0];
         assert_eq!(sources, &vec![source], "store provenance must be the MMIO read site");
         assert_eq!(*pc, 0x104);
         assert_eq!(*addr, 0x2000_0000);
         assert_eq!(*size, 4);
         assert_eq!(*value, 0xdead_beef);
+        assert!(*value_known, "the byte came from the mock, so the value is known");
         assert!(!e.shadow.mem_tag_range(0x2000_0000, 4).is_clean());
     }
 
@@ -2302,6 +3066,156 @@ mod tests {
         e.run_block(&block, &mut MockEnv::new());
 
         assert!(recorded.borrow().magics.is_empty());
+    }
+
+    /// Addresses are rejected on their shape, and the two shapes are not the same
+    /// test: a negative artifact has to be measured at the width of the comparison
+    /// it came from.
+    #[test]
+    fn address_shaped_constants_are_not_discriminants() {
+        // Four-byte protocol constants that merely *look* large.  A single
+        // `>= 0x0800_0000` threshold demoted all of these, silently: they are the
+        // values a firmware compares a genuinely-read word against.
+        for value in [0xdead_beef_u64, 0x8950_4e47, 0x7f45_4c46] {
+            assert!(
+                !looks_like_address(value, 4),
+                "{value:#x} is a constant, not an address"
+            );
+        }
+        // A pointer into SRAM: the `_malloc_r` comparison the dump showed.
+        assert!(looks_like_address(0x2000_0e70, 4));
+        // `-1` and `-0x400` masked back to four bytes.
+        assert!(looks_like_address(0xffff_ffff_ffff_ffff, 4));
+        assert!(looks_like_address(0xffff_fc00, 4));
+        // The same artifact at another width, which the four-byte test misses.
+        assert!(looks_like_address(0xffff, 2), "a two-byte -1");
+        assert!(looks_like_address(0xff, 1), "a one-byte -1");
+        // ... without swallowing everything at that width.
+        assert!(!looks_like_address(0x2000, 2));
+        assert!(!looks_like_address(0x0d, 1));
+    }
+
+    /// The demotion is visible on the event: a pointer comparison reached through
+    /// input taint is still reported, at a confidence the role map will refuse.
+    #[test]
+    fn pointer_comparison_is_demoted_not_dropped() {
+        let mut e = engine();
+        e.pin_site(0x100, 0x5800_0000);
+
+        let mut p = pcode::Block::new();
+        p.push(marker(0x100));
+        p.push((reg(1), Op::Load(0), reg(5)));
+        p.push((reg(2), Op::IntSub, reg(1), Value::Const(0x2000_0e70, 8)));
+        p.push((reg(3), Op::IntEqual, reg(2), Value::Const(0, 8)));
+        let block = lifter_block(p, 0x100, 0x108, BlockExit::invalid());
+
+        let mut env = MockEnv::new();
+        env.regs.insert(5, 0x5800_0000);
+
+        let (observer, recorded) = Recorder::new();
+        e.set_observer(Box::new(observer));
+        e.run_block(&block, &mut env);
+
+        let recorded = recorded.borrow();
+        assert_eq!(recorded.magics.len(), 1, "the event is kept as evidence");
+        assert_eq!(recorded.magics[0].1, 0x2000_0e70);
+        assert_eq!(recorded.magics[0].2, DEMOTED_CONFIDENCE, "below the threshold");
+        assert_eq!(recorded.magic_evidence[0].compare_pc, 0x100);
+        drop(recorded);
+        assert_eq!(e.counters().demoted_discriminants, 1);
+    }
+
+    /// The counter and the threshold must not eat real constants: everything the
+    /// old blanket rule demoted, and the artifacts the new one still has to catch.
+    #[test]
+    fn demotion_catches_the_artifacts_and_spares_the_protocol_constant() {
+        fn magic_of(value: u64, size: u8) -> (Vec<f32>, u64, Vec<(&'static str, u64)>) {
+            let mut e = engine();
+            e.pin_site(0x100, 0x5800_0000);
+
+            let mut p = pcode::Block::new();
+            p.push(marker(0x100));
+            p.push((reg(1), Op::Load(0), reg(5)));
+            p.push((reg(2), Op::IntSub, reg(1), Value::Const(value, size)));
+            p.push((reg(3), Op::IntEqual, reg(2), Value::Const(0, size)));
+            let block = lifter_block(p, 0x100, 0x108, BlockExit::invalid());
+
+            let mut env = MockEnv::new();
+            env.regs.insert(5, 0x5800_0000);
+
+            let (observer, recorded) = Recorder::new();
+            e.set_observer(Box::new(observer));
+            e.run_block(&block, &mut env);
+            let recorded = recorded.borrow();
+            (
+                recorded.magics.iter().map(|(_, _, c)| *c).collect(),
+                e.counters().demoted_discriminants,
+                e.counters().demoted_by_reason,
+            )
+        }
+
+        // A four-byte word the firmware really reads: survives at full confidence.
+        assert_eq!(magic_of(0xdead_beef, 4), (vec![0.85], 0, vec![]));
+        // A pointer, and the ones-run artifacts at two different widths.  The
+        // bucket matters: the paper has to say which mechanism dominates, and
+        // "427 demoted" alone cannot.
+        assert_eq!(
+            magic_of(0x2000_0e70, 4),
+            (vec![DEMOTED_CONFIDENCE], 1, vec![("address_shape", 1)])
+        );
+        assert_eq!(
+            magic_of(0xffff_fc00, 4),
+            (vec![DEMOTED_CONFIDENCE], 1, vec![("ones_at_width", 1)])
+        );
+        assert_eq!(
+            magic_of(0xffff_ffff_ffff_ffff, 8),
+            (vec![DEMOTED_CONFIDENCE], 1, vec![("ones_at_width", 1)])
+        );
+    }
+
+    /// The add form states its constant negated, and that negation is its own
+    /// bucket: it is the shape `cmn r0, #1` takes, and it is not something a
+    /// reader can see in the compared value alone.
+    #[test]
+    fn add_form_negation_is_its_own_demotion_bucket() {
+        let mut e = engine();
+        e.pin_site(0x100, 0x5800_0000);
+
+        let mut p = pcode::Block::new();
+        p.push(marker(0x100));
+        p.push((reg(1), Op::Load(0), reg(5)));
+        // `cmn r1, #1` is `r1 + 1 == 0`, so the stated constant is 0xffff_ffff.
+        p.push((reg(2), Op::IntAdd, reg(1), Value::Const(1, 4)));
+        p.push((reg(3), Op::IntEqual, reg(2), Value::Const(0, 4)));
+        let block = lifter_block(p, 0x100, 0x108, BlockExit::invalid());
+
+        let mut env = MockEnv::new();
+        env.regs.insert(5, 0x5800_0000);
+
+        let (observer, recorded) = Recorder::new();
+        e.set_observer(Box::new(observer));
+        e.run_block(&block, &mut env);
+
+        assert_eq!(recorded.borrow().magics[0].2, DEMOTED_CONFIDENCE);
+        assert_eq!(e.counters().demoted_by_reason, vec![("negated_add_form", 1)]);
+    }
+
+    /// The per-site pool policy: mixed evidence wins, and nothing is demoted in
+    /// bulk -- a pooled constant is only refused when its own site was judged.
+    #[test]
+    fn pool_demotion_is_per_site_and_yields_to_mixed_evidence() {
+        // Nothing is demoted while no site has been judged.
+        assert_eq!(pool_demotion_in(&[], 0x800430a, false), None);
+        // A site that *was* judged carries its reason.
+        let judged = [(0x800430a, "command_name_compare")];
+        assert_eq!(pool_demotion_in(&judged, 0x800430a, false), Some("command_name_compare"));
+        // A different site is untouched: the policy is per `compare_pc`.
+        assert_eq!(pool_demotion_in(&judged, 0x8004cfc, false), None);
+        // Mixed evidence wins even at a judged site: that value is a real
+        // accumulator being finalised, not a pooled constant.
+        assert_eq!(pool_demotion_in(&judged, 0x800430a, true), None);
+        // The live policy starts empty, so this target keeps its command names.
+        assert_eq!(pool_demotion(0x800430a, false), None);
     }
 
     /// The length rule: a tainted value gating a loop that reads another stream
@@ -2840,6 +3754,11 @@ mod tests {
         assert!(recorded.magics.is_empty(), "an echo is not a magic constant");
         assert_eq!(recorded.checksums.len(), 1);
         assert_eq!(recorded.checksums[0].1, 0.5);
+        assert_eq!(
+            recorded.checksum_arms,
+            vec![ChecksumArm::CompareOtherTainted],
+            "the arm is what a policy decision needs; two arms share 0.5"
+        );
     }
 
     /// A bare variable-vs-variable equality is the same signal.
@@ -2868,6 +3787,90 @@ mod tests {
 
         assert!(recorded.borrow().magics.is_empty());
         assert_eq!(recorded.borrow().checksums.len(), 1);
+        assert_eq!(
+            recorded.borrow().checksum_arms,
+            vec![ChecksumArm::EqualBothTainted],
+            "the other 0.5 arm, and it is a different rule"
+        );
+        assert_eq!(
+            recorded.borrow().checksum_rejections,
+            vec![None],
+            "two different reads is the accepted shape"
+        );
+    }
+
+    /// One read compared with a copy of itself is not a checksum: the rule asks
+    /// whether *two received values* were compared.
+    #[test]
+    fn checksum_of_one_read_is_evidence_only() {
+        let mut e = engine();
+        e.pin_site(0x100, 0x5800_0000);
+
+        let mut p = pcode::Block::new();
+        p.push(marker(0x100));
+        p.push((reg(1), Op::Load(0), reg(5)));
+        // A copy carries the same provenance: one read on both sides.
+        p.push((reg(2), Op::Copy, reg(1)));
+        p.push((reg(3), Op::IntEqual, reg(1), reg(2)));
+        let block = lifter_block(p, 0x100, 0x110, BlockExit::invalid());
+
+        let mut env = MockEnv::new();
+        env.regs.insert(5, 0x5800_0000);
+
+        let (observer, recorded) = Recorder::new();
+        e.set_observer(Box::new(observer));
+        e.run_block(&block, &mut env);
+
+        let recorded = recorded.borrow();
+        assert_eq!(recorded.checksum_arms, vec![ChecksumArm::EqualBothTainted]);
+        assert_eq!(
+            recorded.checksum_rejections,
+            vec![Some(ChecksumRejection::SingleRead)],
+            "a value compared with its own copy states nothing"
+        );
+        assert_eq!(recorded.checksums[0].0.len(), 1, "one read site, not two");
+    }
+
+    /// Two *data* values compared is an echo; two *flags* compared is a condition.
+    ///
+    /// `bgt` lifts to `NG == OV`, and both flags carry the taint of the read they
+    /// were computed from, so without the flag filter every conditional test on an
+    /// input byte reports that byte as checksum input.  On the target that is
+    /// exactly what happened: `readline+0x23` (the `bgt` after `cmp r0,#0xd`)
+    /// produced 132 checksum events, one per console byte, all at width 1.
+    #[test]
+    fn flag_pair_predicate_is_not_checksum() {
+        let mut e = engine();
+        e.pin_site(0x100, 0x5800_0000);
+        // The sleigh names for the ARM flags; `install` resolves the same set.
+        e.set_flag_vars([20, 21]);
+
+        let mut p = pcode::Block::new();
+        p.push(marker(0x100));
+        p.push((reg(1), Op::Load(0), reg(5)));
+        // tmp = c - 0xd, then the flag algebra of `bgt`: NG == OV.
+        p.push((reg(2), Op::IntSub, reg(1), Value::Const(0xd, 4)));
+        p.push((reg(20), Op::IntSignedLess, reg(2), Value::Const(0, 4)));
+        p.push((reg(21), Op::IntSignedCarry, reg(2), Value::Const(0, 4)));
+        p.push((reg(3), Op::IntEqual, reg(20), reg(21)));
+        let block = lifter_block(p, 0x100, 0x110, BlockExit::invalid());
+
+        let mut env = MockEnv::new();
+        env.regs.insert(5, 0x5800_0000);
+
+        let (observer, recorded) = Recorder::new();
+        e.set_observer(Box::new(observer));
+        e.run_block(&block, &mut env);
+
+        let recorded = recorded.borrow();
+        // The event is still reported -- it is evidence -- but with the refusal
+        // attached, so the collector records it and produces no role from it.
+        assert_eq!(recorded.checksum_arms, vec![ChecksumArm::EqualBothTainted]);
+        assert_eq!(
+            recorded.checksum_rejections,
+            vec![Some(ChecksumRejection::Condition)],
+            "a flag pair computes a condition out of one read's taint"
+        );
     }
 
     /// A hard-coded checksum comparison: `tmp = crc - 0x1234; tmp == 0`.  The
@@ -2897,6 +3900,11 @@ mod tests {
         assert!(recorded.magics.is_empty(), "a checksum constant is not a magic field");
         assert_eq!(recorded.checksums.len(), 1);
         assert_eq!(recorded.checksums[0].1, 0.6);
+        assert_eq!(
+            recorded.checksum_arms,
+            vec![ChecksumArm::CompareMixedBacktrack],
+            "a mixed base compared against a hard-coded constant"
+        );
     }
 
     /// A partial mask comparison is a real discriminant: only a test for the mask
@@ -3178,7 +4186,8 @@ mod tests {
         env.regs.insert(10, 0x5800_000c);
         env.mem.insert(0x5800_0008, 5);
 
-        let (observer, recorded) = Recorder::new();
+        // This test reads the engine's own bookkeeping, not the observer's.
+        let (observer, _recorded) = Recorder::new();
         e.set_observer(Box::new(observer));
 
         // Iteration 1: the loop continues, so the read of the second stream is
@@ -3331,6 +4340,172 @@ mod tests {
     /// The block contains the coverage bitmap update exactly as the p-code dump
     /// shows it (`mem.2[0x0:8]` read-modify-write, i.e. a *clean* store into the
     /// trace space) *and* a real MMIO load that is compared against a constant.
+    /// A branch on `input & 0x20` is a test of bit 5, and what the gated code does
+    /// with it is the evidence that the bit gates anything.
+    #[test]
+    fn gate_test_reports_the_tested_bit_and_what_it_buys() {
+        let mut e = engine();
+        e.pin_site(0x100, 0x5800_0000);
+        e.pin_site(0x300, 0x5800_0004);
+
+        let mut p = pcode::Block::new();
+        p.push(marker(0x100));
+        p.push((reg(1), Op::Load(0), reg(5)));
+        // The three shapes the derivation has to see through: a mask, then the sign
+        // test the branch actually uses.
+        p.push((reg(2), Op::IntAnd, reg(1), Value::Const(0x20, 4)));
+        p.push((reg(3), Op::IntSignedLess, reg(2), Value::Const(0, 4)));
+        let cond = BlockExit::Branch {
+            cond: Value::Var(reg(3)),
+            // Forward: a decision, not a loop, so this test is about the bit test
+            // alone rather than about gating.
+            target: Target::External(Value::Const(0x300, 4)),
+            fallthrough: Target::External(Value::Const(0x400, 4)),
+        };
+        let branch = lifter_block(p, 0x100, 0x108, cond);
+
+        // The code the gate buys: a read of another stream.
+        let mut p2 = pcode::Block::new();
+        p2.push(marker(0x300));
+        p2.push((reg(5), Op::Load(0), reg(8)));
+        let gated = lifter_block(p2, 0x300, 0x308, BlockExit::invalid());
+
+        let mut env = MockEnv::new();
+        env.regs.insert(5, 0x5800_0000);
+        env.regs.insert(8, 0x5800_0004);
+
+        let (observer, recorded) = Recorder::new();
+        e.set_observer(Box::new(observer));
+        e.run_block(&branch, &mut env);
+        e.run_block(&gated, &mut env);
+        // The pass ends: a gate still waiting for a consequence is unobserved, and
+        // this one was answered by the read above.
+        e.emit_observations();
+
+        let recorded = recorded.borrow();
+        assert_eq!(recorded.gates.len(), 1, "{:?}", recorded.gates);
+        let (sources, mask, branch_pc, outcome) = &recorded.gates[0];
+        assert_eq!(*mask, 0x20, "the bit under test");
+        assert_eq!(*branch_pc, 0x100);
+        assert_eq!(sources, &vec![AccessContext::new(0x100, 0x5800_0000)]);
+        assert_eq!(
+            *outcome,
+            GateOutcome::Read { pc: 0x300, addr: 0x5800_0004 },
+            "the gate bought a read of another stream"
+        );
+    }
+
+    /// A sign test on a *derived* value is not a bit of the input.
+    ///
+    /// `cmp r0, #0xd` signs `r0 - 0xd`, and the `bgt`/`blt` that follows is about
+    /// that comparison, not about bit 31 of the byte.  Reporting it as a gate would
+    /// invent a constraint; the comparison itself is the magic rule's business.
+    #[test]
+    fn sign_test_on_a_derived_value_is_not_a_gate() {
+        let mut e = engine();
+        e.pin_site(0x100, 0x5800_0000);
+
+        let mut p = pcode::Block::new();
+        p.push(marker(0x100));
+        p.push((reg(1), Op::Load(0), reg(5)));
+        // `cmp r1, #0xd`: the difference is signed, the byte is not.
+        p.push((reg(2), Op::IntSub, reg(1), Value::Const(0xd, 4)));
+        p.push((reg(3), Op::IntEqual, reg(2), Value::Const(0, 4)));
+        p.push((reg(4), Op::IntSignedLess, reg(2), Value::Const(0, 4)));
+        let block = lifter_block(
+            p,
+            0x100,
+            0x108,
+            BlockExit::Branch {
+                cond: Value::Var(reg(4)),
+                target: Target::External(Value::Const(0x400, 4)),
+                fallthrough: Target::External(Value::Const(0x500, 4)),
+            },
+        );
+
+        let mut env = MockEnv::new();
+        env.regs.insert(5, 0x5800_0000);
+
+        let (observer, recorded) = Recorder::new();
+        e.set_observer(Box::new(observer));
+        e.run_block(&block, &mut env);
+        e.emit_observations();
+
+        let recorded = recorded.borrow();
+        assert_eq!(
+            recorded.magics,
+            vec![(vec![AccessContext::new(0x100, 0x5800_0000)], 0x0d, 0.85)],
+            "the comparison states the constant, which is the magic rule"
+        );
+        assert!(
+            recorded.gates.is_empty(),
+            "and must not also be read as a bit of the difference: {:?}",
+            recorded.gates
+        );
+    }
+
+    /// A gate whose window closes with nothing to show for it is reported as
+    /// unobserved, not guessed at -- and a reset drops whatever is still open
+    /// rather than carrying it into the next pass.
+    ///
+    /// The window itself is `PhaseBEngine::close_gate_window`, which closes pending
+    /// tests when the block's exit is a call or a return (and when the pass ends).
+    #[test]
+    fn gate_without_a_consequence_is_unobserved_and_a_reset_drops_it() {
+        let mut e = engine();
+        e.pin_site(0x100, 0x5800_0000);
+
+        let mut p = pcode::Block::new();
+        p.push(marker(0x100));
+        p.push((reg(1), Op::Load(0), reg(5)));
+        p.push((reg(2), Op::IntAnd, reg(1), Value::Const(0x8, 4)));
+        p.push((reg(3), Op::IntSignedLess, reg(2), Value::Const(0, 4)));
+        // A conditional exit: a gate is a *branch* on the tested bit, so an
+        // `invalid` exit has none to report.  Forward, so this is about the gate
+        // window rather than about gating a loop.
+        let block = lifter_block(
+            p,
+            0x100,
+            0x108,
+            BlockExit::Branch {
+                cond: Value::Var(reg(3)),
+                target: Target::External(Value::Const(0x400, 4)),
+                fallthrough: Target::External(Value::Const(0x500, 4)),
+            },
+        );
+
+        let mut env = MockEnv::new();
+        env.regs.insert(5, 0x5800_0000);
+
+        let (observer, recorded) = Recorder::new();
+        e.set_observer(Box::new(observer));
+        e.run_block(&block, &mut env);
+        assert!(recorded.borrow().gates.is_empty(), "the gate is still open");
+
+        e.emit_observations();
+        {
+            let recorded = recorded.borrow();
+            assert_eq!(recorded.gates.len(), 1);
+            assert_eq!(recorded.gates[0].1, 0x8, "the bit under test");
+            assert_eq!(
+                recorded.gates[0].3,
+                GateOutcome::Unobserved,
+                "nothing consumed input inside the window"
+            );
+        }
+
+        // A gate opened after the pass must not survive the reset: if it did, the
+        // next pass would report this one's evidence under its own name.
+        e.run_block(&block, &mut env);
+        e.reset_pass(HashMap::new(), Vec::new());
+        e.emit_observations();
+        assert_eq!(
+            recorded.borrow().gates.len(),
+            1,
+            "the reset dropped the pending gate instead of reporting it later"
+        );
+    }
+
     /// The instrumentation must neither wipe guest taint that shares the shadow
     /// key nor produce any observation, while the real taint must survive and
     /// its constant must be recovered.
@@ -3420,6 +4595,52 @@ mod tests {
             vec![(vec![source], 0xa5, 0.6)],
             "literal-pool comparison must report the concrete value at reduced confidence"
         );
+    }
+
+    /// The literal-pool fallback is an open path, so it is counted and flagged per
+    /// event instead of being blended in with the immediates the firmware stated.
+    #[test]
+    fn pool_fallback_produces_counted_evidence() {
+        let mut e = engine();
+        e.pin_site(0x100, 0x5800_0000);
+
+        let mut p = pcode::Block::new();
+        p.push(marker(0x100));
+        p.push((reg(1), Op::Load(0), reg(5))); // the input
+        // A marker of its own: without it the pool load lands on pc 0x100, which is
+        // the pinned read site, and would be interpreted as a *second* MMIO read of
+        // that site (a single-stream site resolves every load at its pc, by design).
+        // The comparison would then see two input-derived sides instead of a clean
+        // pooled constant.
+        p.push(marker(0x104));
+        p.push((reg(7), Op::Load(0), Value::Const(0x1060, 4))); // the pool constant
+        p.push(marker(0x108));
+        p.push((reg(2), Op::IntSub, reg(1), reg(7))); // no immediate anywhere
+        p.push((reg(3), Op::IntEqual, reg(2), Value::Const(0, 4)));
+
+        let block = lifter_block(p, 0x100, 0x110, BlockExit::invalid());
+        let mut env = MockEnv::new();
+        env.regs.insert(5, 0x5800_0000);
+        env.mem.insert(0x1060, 0x41);
+
+        let (observer, recorded) = Recorder::new();
+        e.set_observer(Box::new(observer));
+        e.run_block(&block, &mut env);
+
+        let source = AccessContext::new(0x100, 0x5800_0000);
+        {
+            let recorded = recorded.borrow();
+            // The behaviour is unchanged: the event is still reported.
+            assert_eq!(recorded.magics, vec![(vec![source], 0x41, 0.6)]);
+            // ... but it now says where the value came from.  This is not
+            // `from_fallback`, which is about the taint rather than the constant.
+            assert_eq!(recorded.magic_evidence.len(), 1);
+            assert!(recorded.magic_evidence[0].from_pool);
+            assert!(!recorded.magic_evidence[0].from_fallback);
+            assert_eq!(recorded.magic_evidence[0].compare_pc, 0x108);
+        }
+        assert_eq!(e.counters().pool_discriminants, 1);
+        assert_eq!(e.counters().demoted_discriminants, 0, "0x41 is not an address");
     }
 
     /// A flag update whose operand is clean must not be mistaken for a comparison
@@ -3521,6 +4742,11 @@ mod tests {
 
         let recorded = recorded.borrow();
         assert_eq!(recorded.checksums.len(), 1, "a mixed store is checksum evidence");
+        assert_eq!(
+            recorded.checksum_arms,
+            vec![ChecksumArm::StoreMixed],
+            "the store arm, distinct from the two 0.5 compare arms"
+        );
         assert!(recorded.stores.is_empty(), "and must not also be reported as a sink");
     }
 }

@@ -207,8 +207,7 @@ pub(crate) fn apply_mutation<R, S>(
     match mutation {
         Mutation::BitFlip => {
             let bit_offset: usize = rng.gen_range(offset * 8..len * 8);
-            let mask = 1 << (bit_offset % 8);
-            input[bit_offset / 8] ^= input[bit_offset / 8] & mask;
+            flip_bit(input, bit_offset);
         }
         Mutation::IncDec => {
             let offset: usize = rng.gen_range(offset..len);
@@ -316,6 +315,19 @@ fn random_subslice<'a, R: Rng>(rng: &mut R, slice: &'a [u8]) -> &'a [u8] {
     &slice[start..=end]
 }
 
+/// Flip one bit of `input`, in either direction.
+///
+/// The write is a plain `^= mask`.  The earlier form `byte ^= byte & mask` XORs a
+/// byte with itself masked by the bit, which only ever *clears* a set bit: a clear
+/// bit stays clear, so half of the intended flips were no-ops and the mutator
+/// could never turn a 0 into a 1.
+fn flip_bit(input: &mut [u8], bit_offset: usize) {
+    let byte = bit_offset / 8;
+    if let Some(b) = input.get_mut(byte) {
+        *b ^= 1 << (bit_offset % 8);
+    }
+}
+
 fn splice_input<R: Rng>(rng: &mut R, input: &mut Vec<u8>, offset: usize, other: &[u8]) {
     if other.is_empty() {
         return;
@@ -325,8 +337,69 @@ fn splice_input<R: Rng>(rng: &mut R, input: &mut Vec<u8>, offset: usize, other: 
     let end: usize = rng.gen_range(start + 1..other.len() + 1);
     let position: usize = rng.gen_range(offset..input.len());
 
-    let mut result = vec![];
+    // The splice is built into a new buffer and then written back: without the
+    // assignment the work is discarded and the mutation is a no-op (the caller's
+    // input is unchanged, so the fuzzer re-runs the same seed for nothing).
+    let mut result = Vec::with_capacity(input.len() + (end - start));
     result.extend_from_slice(&input[..position]);
     result.extend_from_slice(&other[start..end]);
     result.extend_from_slice(&input[position..]);
+    *input = result;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::{rngs::StdRng, SeedableRng};
+
+    /// A flip has to work in both directions, not just clear a set bit.
+    #[test]
+    fn bit_flip_sets_and_clears() {
+        let mut clear = [0x00u8];
+        flip_bit(&mut clear, 3);
+        assert_eq!(clear, [0x08], "a clear bit must be set");
+
+        let mut set = [0x08u8];
+        flip_bit(&mut set, 3);
+        assert_eq!(set, [0x00], "a set bit must be cleared");
+
+        // Bits other than the addressed one are untouched, and the whole byte is
+        // reachable (bit 7 of byte 0, bit 0 of byte 1).
+        let mut bytes = [0x00u8, 0x00];
+        flip_bit(&mut bytes, 7);
+        flip_bit(&mut bytes, 8);
+        assert_eq!(bytes, [0x80, 0x01]);
+    }
+
+    /// The splice has to reach the caller's buffer: building the result and
+    /// dropping it leaves the input untouched, which makes the mutation a no-op.
+    #[test]
+    fn splice_writes_the_result_back() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let before = vec![1u8, 2, 3, 4, 5, 6];
+        let mut input = before.clone();
+        let other = vec![9u8; 8];
+
+        splice_input(&mut rng, &mut input, 0, &other);
+
+        assert!(
+            input.len() > before.len(),
+            "the splice must insert bytes: {input:?}"
+        );
+        assert!(input.contains(&9), "the inserted bytes come from `other`: {input:?}");
+        // The original bytes are all still there, in order.
+        let mut remaining = input.iter().copied().filter(|b| *b != 9);
+        for b in &before {
+            assert_eq!(remaining.next(), Some(*b), "the original bytes survive in order");
+        }
+    }
+
+    /// Nothing to splice in is not an error, and not a change either.
+    #[test]
+    fn splice_with_an_empty_other_is_a_no_op() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut input = vec![1u8, 2, 3];
+        splice_input(&mut rng, &mut input, 0, &[]);
+        assert_eq!(input, vec![1u8, 2, 3]);
+    }
 }
