@@ -1,4 +1,5 @@
 mod config;
+mod contract;
 mod coverage;
 mod debug_alloc;
 mod debugging;
@@ -332,6 +333,10 @@ fn fuzzing_loop(mut fuzzer: Fuzzer, run_for: Option<Duration>) -> anyhow::Result
 pub enum MutationKind {
     Extension { stream: u64, kind: mutations::Extension },
     Mutation { stream: u64, kind: mutations::Mutation },
+    /// A mutation the role map justified: which layer acted, at which position, with
+    /// which value.  Kept in the corpus metadata so the ablation arms can be compared
+    /// on the inputs each one produced.
+    Evidence { stream: u64, action: contract::ActionKind, offset: u32, value: u64 },
 }
 
 impl From<(u64, mutations::Extension)> for MutationKind {

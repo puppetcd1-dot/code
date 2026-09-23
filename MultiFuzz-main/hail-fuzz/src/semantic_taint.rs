@@ -229,6 +229,15 @@ pub struct ReadRecord {
     pub site_pc: u64,
     pub stream: StreamKey,
     pub input_offset: u32,
+    /// Which read of this site this was, counted where the read happened.
+    ///
+    /// The analysis side counts the reads it interprets; this is the execution
+    /// side's own count for the same site, so a fragment can be bound by identity
+    /// instead of by queue position.  Positional binding cannot tell "the two sides
+    /// saw the same reads" from "the two sides drifted and the queue still had a
+    /// record to hand over" -- and the second is a fragment attributed to the wrong
+    /// occurrence, which is what a variable-width read or a dropped read produces.
+    pub occ: u32,
     pub size: u8,
     pub value: u64,
     pub icount: u64,
@@ -254,6 +263,8 @@ pub struct ReadLedger {
     per_site: Arc<Mutex<HashMap<(u64, StreamKey), VecDeque<ReadRecord>>>>,
     order: Arc<Mutex<Vec<ReadRecord>>>,
     next_seq: Arc<Mutex<u64>>,
+    /// Reads seen per site: the occurrence stamped on each record.
+    per_site_count: Arc<Mutex<HashMap<(u64, StreamKey), u32>>>,
     limit: usize,
 }
 
@@ -271,6 +282,7 @@ impl ReadLedger {
             per_site: Arc::new(Mutex::new(HashMap::new())),
             order: Arc::new(Mutex::new(Vec::new())),
             next_seq: Arc::new(Mutex::new(0)),
+            per_site_count: Arc::new(Mutex::new(HashMap::new())),
             limit,
         }
     }
@@ -303,11 +315,20 @@ impl ReadLedger {
             *next_seq += 1;
             seq
         };
+        // The occurrence is counted here, where the read happened, and not derived
+        // by the analysis: that is the whole point of recording it.
+        let occ = {
+            let mut counts = self.per_site_count.lock().expect("read ledger poisoned");
+            let occ = counts.entry((site_pc, stream)).or_insert(0);
+            *occ += 1;
+            *occ
+        };
         let record = ReadRecord {
             seq,
             site_pc,
             stream,
             input_offset,
+            occ,
             size: value.len().min(u8::MAX as usize) as u8,
             value: encode_value(value),
             // Kept because aligning a parent execution against a mutated one needs a
@@ -389,24 +410,48 @@ impl ReadLedger {
         self.per_site.lock().expect("read ledger poisoned").clear();
         self.order.lock().expect("read ledger poisoned").clear();
         *self.next_seq.lock().expect("read ledger poisoned") = 0;
+        self.per_site_count.lock().expect("read ledger poisoned").clear();
     }
 
-    /// Positionally take the next read for `site`, skipping records that the
-    /// pass already consumed.  Sites are read strictly forward, so a record
-    /// before the expected offset is a stale leftover from a partially observed
-    /// block and can be dropped.
-    fn take_next(&self, site_pc: u64, stream: StreamKey, expected: u32) -> Option<ReadRecord> {
+    /// Take the record the *execution* produced for `occ`.
+    ///
+    /// The occurrence is the identity the analysis and the execution can be
+    /// compared on: both count reads of one site, from different places.  When they
+    /// agree this is an exact match rather than "the next one in the queue", and
+    /// when they disagree the caller is told, because a queue can hand over the
+    /// *wrong* occurrence and still look consistent.
+    ///
+    /// The fallback keeps the old positional behaviour for the disagreeing case
+    /// (the record at the front, whatever its occurrence), so a target where the
+    /// two sides drift degrades to what the pipeline did before rather than losing
+    /// the attribution -- with the difference now counted instead of assumed away.
+    ///
+    /// Records behind both the expected offset *and* the occurrence are dropped:
+    /// they are reads this pass never claimed, i.e. the same divergence signal.
+    fn take_occurrence(
+        &self,
+        site_pc: u64,
+        stream: StreamKey,
+        occ: u32,
+        expected: u32,
+    ) -> (Option<ReadRecord>, bool) {
         let mut per_site = self.per_site.lock().expect("read ledger poisoned");
-        let queue = per_site.get_mut(&(site_pc, stream))?;
+        let Some(queue) = per_site.get_mut(&(site_pc, stream)) else {
+            return (None, false);
+        };
         while let Some(front) = queue.front() {
-            if front.input_offset < expected {
+            if front.input_offset < expected || front.occ < occ {
                 queue.pop_front();
             }
             else {
                 break;
             }
         }
-        queue.pop_front()
+        match queue.front() {
+            None => (None, false),
+            Some(front) if front.occ == occ => (queue.pop_front(), true),
+            Some(_) => (queue.pop_front(), false),
+        }
     }
 
     /// Reads that were recorded but never consumed by a fragment binding.
@@ -455,6 +500,18 @@ impl ReadLedger {
     /// from the bytes the firmware only needed in order to read its own device
     /// state: on the target, one stream carried the console text and five carried
     /// a polled status register or a clock/GPIO configuration value.
+    /// Reads per stream: the profile reports how *often* a stream was read, which
+    /// the byte count cannot say (a 4-byte read and four 1-byte reads are
+    /// different shapes of the same traffic).
+    pub fn reads_by_stream(&self) -> HashMap<StreamKey, u64> {
+        let order = self.order.lock().expect("read ledger poisoned");
+        let mut reads: HashMap<StreamKey, u64> = HashMap::new();
+        for record in order.iter() {
+            *reads.entry(record.stream).or_insert(0) += 1;
+        }
+        reads
+    }
+
     pub fn bytes_by_stream(&self) -> HashMap<StreamKey, u64> {
         let order = self.order.lock().expect("read ledger poisoned");
         let mut bytes: HashMap<StreamKey, u64> = HashMap::new();
@@ -600,9 +657,42 @@ fn parse_u64(value: &str) -> Result<u64, std::num::ParseIntError> {
     }
 }
 
+/// Version of the analysis artefact, stamped into every report and log line.
+///
+/// Bumped whenever a field is added, removed, or changes meaning.  Three rounds
+/// were spent comparing artifacts from different builds -- a missing counter and a
+/// contradicting one had to be deduced from the numbers -- so the version is
+/// recorded instead: a run says which revision produced it.
+///
+/// 1: punch-list fields (pruned_magic, pool_discriminants, demoted, device_writes).
+/// 2: checksum arm table + rejection reasons.
+/// 3: flag-pair rejection, sink reasons, gate tests, store_values_unknown, the
+///    three-way byte split.
+/// 4: gate masks reaching the branch (inherit_test), the split's "only a store"
+///    test, gate_masks/gate_tests counters, stream profiles and field projections.
+/// 5: the class rule reads *structure* (several positions carrying constants, or a
+///    delimiter class) rather than the mere existence of a constant, the
+///    config-flag shape is checked first, and a bound counts as ring evidence only
+///    when its source and target are the same stream.  An artifact that reports a
+///    stream with no features at all as `channel` was built before this.
+/// 6: the budget follows the stream's profile instead of its sinks -- a stream the
+///    profile calls a register is device state even if something stored one of its
+///    reads, which is what had turned 589 bytes of USART status poll into
+///    "protocol".
+/// 7: the payload decision is per (bound source, target read) rather than per
+///    stream, every recorded read carries the occurrence it was, and a gate is
+///    confirmed by the ratio of its *observed* samples that consumed input instead
+///    of by the absence of unobserved ones.
+/// 8: promoting a run of consumed bytes to payload is skipped on a stream the
+///    profile calls a register, so that rule is no longer a stream-level way around
+///    the relation the payload decision was just made to depend on.
+pub const ANALYSIS_SCHEMA: u32 = 8;
+
 /// Summary of one analysis pass, for logs and reports.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct AnalysisReport {
+    /// See [`ANALYSIS_SCHEMA`].
+    pub schema: u32,
     pub mmio_reads: usize,
     pub read_sites: usize,
     pub source_fragments: usize,
@@ -756,6 +846,78 @@ pub struct GateConstraint {
     pub weak: u32,
     /// Samples that showed no consequence inside the window.
     pub unobserved: u32,
+    /// The three states the mutation side consumes, and nothing finer:
+    /// `confirmed` (every sample consumed input -- fix the bit), `candidate`
+    /// (some samples were weak: report it, do not fix it), `unobserved` (nothing
+    /// was seen: report and ignore).
+    pub state: &'static str,
+    pub confidence: f32,
+}
+
+/// A discriminant recovered from the literal pool, projected onto the input bytes
+/// it was compared with.
+///
+/// The same `site -> offset` join as the gate projection, which is why it is one
+/// function: both ask "which input bytes is this event about".  This is the
+/// evidence a per-site pool policy is decided from (`compare_pc` plus the bytes).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct PoolField {
+    pub stream: StreamKey,
+    pub offset_range: (u32, u32),
+    pub compare_pc: u64,
+    pub events: u32,
+}
+
+/// A `(stream, offset)` where a gate and a magic statement disagree.
+///
+/// Reported rather than arbitrated.  A byte can legitimately be both compared
+/// against a constant and have a bit tested, so this is not an error by itself --
+/// it is the list a reader has to look at, because the two statements cannot both
+/// be "the value this byte must hold", and a stream model that emits both has
+/// conflated two consumers.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct FieldCollision {
+    pub stream: StreamKey,
+    pub offset_range: (u32, u32),
+    pub gate_mask: u64,
+    pub branch_pc: u64,
+    pub magic_value: u64,
+    pub compare_pc: u64,
+}
+
+/// What one run's telemetry says about a stream.
+///
+/// Six features, all of them counts over evidence the pass already emits, and a
+/// class this run's evidence supports.  The *verdict* is not here: a stream whose
+/// profile flips between seeds cannot be a data channel (its meaning would depend
+/// on the input), so the stable classification is the aggregate's job -- see
+/// `_channel_model.py`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StreamProfile {
+    pub stream: StreamKey,
+    pub reads: u64,
+    pub bytes: u64,
+    /// Asserted constants on this stream.
+    pub contract_magic: u32,
+    /// Length bounds on this stream.
+    pub contract_length: u32,
+    /// Magic entries whose discriminants vary by position (a delimiter is the same
+    /// value everywhere and is reported as a stream constraint instead).
+    pub positional_magic: u32,
+    /// How many of the terminator/separator alphabet appear among the values:
+    /// `\n`, `\r`, 0x7f, space, `"`, `'`, `\\`.
+    pub terminators: u32,
+    /// Printable-ASCII values recovered from the literal pool: a dispatch table.
+    pub ascii_pool: u32,
+    /// Bounds whose reads were kept as payload on a stream that is also stored to:
+    /// a buffer the firmware fills and reads back.
+    pub ring_bounds: u32,
+    /// Gates recognised on this stream, against the comparisons on it.
+    pub gate_masks: u32,
+    pub compares: u32,
+    /// One value, one site, no positional structure: the shape of a config flag.
+    pub flag_constant: bool,
+    pub class: &'static str,
     pub confidence: f32,
 }
 
@@ -814,8 +976,15 @@ pub struct RoleMapOutput {
     /// copy into memory (`store`), which is a use of the value rather than a
     /// contract on it.
     pub sink_sites: Vec<(u64, StreamKey, &'static str)>,
-    /// The bits the firmware branches on, that gate input consumption.
+    /// The bits the firmware branches on, that gate input consumption, projected
+    /// onto the input bytes they belong to.
     pub gate_constraints: Vec<GateConstraint>,
+    /// Literal-pool discriminants, projected the same way.
+    pub pool_fields: Vec<PoolField>,
+    /// `(stream, offset)` points where a gate and a magic statement disagree.
+    pub field_collisions: Vec<FieldCollision>,
+    /// Per-stream profile: the six features, and the class this run supports.
+    pub stream_profiles: Vec<StreamProfile>,
     /// Which rule claimed the checksum role, at which instruction, and how often.
     ///
     /// The role entries only say "some bytes are checksum input"; this table says
@@ -867,6 +1036,16 @@ struct GateTally {
 /// nothing about whether the bit gates anything.
 const MIN_GATE_SAMPLES: u32 = 3;
 
+/// Share of the *observed* samples of a gate that must have consumed input.
+///
+/// An unobserved sample is not a counter-example: a polling gate always has a few
+/// trailing ones (the last poll's consequence is outside the loop), and letting
+/// them veto would make "fixed" unreachable for exactly the gates this analysis
+/// exists to find.  A weak sample is different -- the gated code only touched the
+/// firmware's own registers, so the bit demonstrably gates no input flow -- and
+/// that is what the ratio is over.
+const GATE_CONFIRM_RATIO: f32 = 0.9;
+
 #[derive(Default)]
 struct RoleCollectorState {
     /// Keyed by `(pc, stream, occ)`: one entry per read *occurrence*, so a packet
@@ -876,6 +1055,16 @@ struct RoleCollectorState {
     /// Next expected input offset per read site, so positional matching cannot
     /// silently re-use bytes that were already attributed.
     expected_offset: HashMap<(u64, StreamKey), u32>,
+    /// Fragments bound to a record whose occurrence was not the one the analysis
+    /// asked for.  Zero means the two sides counted the same reads at every site,
+    /// which is what makes the fragment offsets trustworthy rather than merely
+    /// plausible.
+    occ_mismatches: usize,
+    /// Whether a bound's target bytes are the payload *that bound's* field paid
+    /// for, keyed by the relation.  Decided in `on_loop_bound`, which is the only
+    /// callback that has the source's occurrences; read by `on_bounded_read`, which
+    /// is told about a read but not about the field that gated it.
+    bound_payload: HashMap<(AccessContext, AccessContext), bool>,
     role_map: RoleMap,
     tainted_stores: usize,
     unbound_loads: usize,
@@ -895,6 +1084,11 @@ struct RoleCollectorState {
     rejected_checksum_events: usize,
     /// Bit tests on input-derived data, keyed by `(source site pc, stream, mask)`.
     gate_samples: BTreeMap<(u64, StreamKey, u64), GateTally>,
+    /// `(compare_pc, sources)` of every event whose constant came from the literal
+    /// pool.  Kept as the raw join input rather than as a count: the projection
+    /// onto input bytes needs the read sites, and that is the same join the gate
+    /// projection uses.
+    pool_events: Vec<(u64, u64, Vec<AccessContext>)>,
     /// Checksum events per (instruction, arm, width).  Kept as a map so identical
     /// executions collapse, and so the table is a summary rather than a log (the
     /// target produced 143 events from a handful of instructions).
@@ -953,6 +1147,11 @@ impl RoleCollector {
         self.state.borrow().size_mismatches
     }
 
+    /// Fragments whose record was not the occurrence the analysis asked for.
+    pub fn occ_mismatches(&self) -> usize {
+        self.state.borrow().occ_mismatches
+    }
+
     pub fn loads_observed(&self) -> usize {
         self.state.borrow().loads_observed
     }
@@ -977,6 +1176,8 @@ impl RoleCollector {
         let mut state = self.state.borrow_mut();
         state.fragments.clear();
         state.expected_offset.clear();
+        state.occ_mismatches = 0;
+        state.bound_payload.clear();
         state.role_map = RoleMap::default();
         state.loop_bounds.clear();
         state.magic_sites.clear();
@@ -998,6 +1199,7 @@ impl RoleCollector {
         state.rejected_checksum_events = 0;
         state.checksum_sites.clear();
         state.gate_samples.clear();
+        state.pool_events.clear();
         state.table_loads = 0;
         state.bounded_reads_marked = 0;
         state.device_state_bounded_reads = 0;
@@ -1021,20 +1223,30 @@ impl RoleCollector {
         // on the input: on the target this is the driver caching a register, which
         // must not inflate the protocol budget.  Everything else is device state
         // the firmware reads to see itself.
-        let mut judged: BTreeSet<StreamKey> = BTreeSet::new();
-        let mut moved: BTreeSet<StreamKey> = BTreeSet::new();
+        // "Moved" is a property of the *whole* stream, not of one sink: a stream
+        // that was judged once is protocol input even if it was also copied, so
+        // the reasons have to be collected per stream before the split.  (Counting
+        // a stream as moved because it has *a* store sink reported two moved
+        // streams with zero moved bytes -- the count and the bytes disagreed.)
+        let mut reasons: BTreeMap<StreamKey, BTreeSet<&'static str>> = BTreeMap::new();
         for (_, stream, reason) in state.sink_sites.iter() {
-            if *reason == "store" {
-                moved.insert(*stream);
-            }
-            else {
-                judged.insert(*stream);
-            }
+            reasons.entry(*stream).or_default().insert(*reason);
         }
+        let judged: BTreeSet<StreamKey> = reasons
+            .iter()
+            .filter(|(_, r)| r.iter().any(|reason| *reason != "store"))
+            .map(|(stream, _)| *stream)
+            .collect();
+        let moved: BTreeSet<StreamKey> = reasons
+            .iter()
+            .filter(|(_, r)| r.iter().all(|reason| *reason == "store"))
+            .map(|(stream, _)| *stream)
+            .collect();
         let data_streams: BTreeSet<StreamKey> = judged.union(&moved).copied().collect();
         let sink_sites: Vec<(u64, StreamKey, &'static str)> =
             state.sink_sites.iter().copied().collect();
         let bytes_by_stream = self.ledger.bytes_by_stream();
+        let reads_by_stream = self.ledger.reads_by_stream();
         let mut device_state_streams: Vec<StreamKey> = Vec::new();
         let (mut protocol_bytes, mut consumed_bytes, mut device_state_bytes) = (0_u64, 0_u64, 0_u64);
         for (stream, bytes) in bytes_by_stream.iter() {
@@ -1055,7 +1267,8 @@ impl RoleCollector {
         // them.  Only what is left over is.
         let (dropped_site_reads, early_stop_leftovers) =
             self.ledger.pending_split(&state.read_sites);
-        let counters = AnalysisReport {
+        let mut counters = AnalysisReport {
+            schema: ANALYSIS_SCHEMA,
             mmio_reads: self.ledger.len(),
             read_sites: self.ledger.site_count(),
             source_fragments: state.fragments.len(),
@@ -1168,17 +1381,14 @@ impl RoleCollector {
                 if fragment.value != bound.count {
                     continue;
                 }
-                let start = fragment.offset_range.1;
-                // Saturating, not a bare cast: `(count * width) as u32` would wrap a
-                // long span into a *small* interval, i.e. it would silently mark the
-                // wrong bytes -- the same class of landmine as a one-way bit flip, a
-                // splice that was never written back and an offset that was always
-                // zero.  Today's input sizes make it unreachable; the conversion is
-                // here so that when it stops being unreachable it is visible as a
-                // clamped span rather than as a wrong one.
-                let span = bound.count.saturating_mul(u64::from(width)).min(u64::from(u32::MAX));
-                let end = start.saturating_add(span as u32);
-                if end > start {
+                // One formula, two consumers: this marks the bytes a confirmed length
+                // pays for, and the mutation stage keeps them long enough to be read
+                // (`contract::payload_span`).  Sharing it is what stops the two from
+                // drifting: the span is saturating, so a long one clamps instead of
+                // wrapping into a small interval that would mark the wrong bytes.
+                if let Some((start, end)) =
+                    crate::contract::payload_span(fragment.offset_range.1, bound.count, width)
+                {
                     derived_payload.push((bound.source.addr, (start, end), 0.85));
                 }
             }
@@ -1213,19 +1423,38 @@ impl RoleCollector {
                 .map(|(_, n)| *n)
                 .sum::<u32>()
                 + tally.device_writes;
-            let samples = confirmed + weak + tally.unobserved;
-            if samples < MIN_GATE_SAMPLES {
-                continue;
+            // A gate with too few samples to *fix* is still reported, as a
+            // candidate: suppressing it entirely left `gate_constraints` empty on
+            // a run that had found a real gate, so the one piece of evidence that
+            // says *which* bit and *which* branch was thrown away.  Fixing needs
+            // `MIN_GATE_SAMPLES`; reporting does not.
+            // Three states, and nothing finer: the mutation side needs to know
+            // whether the bit is fixed (`confirmed`), a candidate to report but not
+            // fix (weak samples present), or only a note (`unobserved`).  No new
+            // confidence tiers are invented for it.
+            // A weak sample is something *observed* -- the gated code wrote to a
+            // peripheral register -- so it is a candidate (report the bit, do not
+            // fix it), not "unobserved".  Only a gate that saw nothing at all is
+            // unobserved.
+            //
+            // Confirmation is a ratio over the *observed* samples, not a veto list:
+            // an unobserved sample means the consequence never showed up inside the
+            // window, which every polling gate has at its tail, and treating it as a
+            // counter-example made "confirmed" unreachable on the target (its four
+            // UART status polls are 133/135, 9/9, 10/10 and 1/1 observed samples).
+            // A weak sample does count against the gate, and the ratio is what turns
+            // "most of what it gated was input" into a confirmation.
+            let observed = confirmed + weak;
+            let enough = observed >= MIN_GATE_SAMPLES;
+            let ratio = if observed == 0 { 0.0 } else { confirmed as f32 / observed as f32 };
+            let (state_name, confidence) = if confirmed == 0 && weak == 0 {
+                ("unobserved", 0.5)
             }
-            let coverage = confirmed as f32 / samples as f32;
-            let confidence = if coverage >= 1.0 {
-                0.8
-            }
-            else if coverage >= 0.5 {
-                0.6
+            else if enough && ratio >= GATE_CONFIRM_RATIO {
+                ("confirmed", 0.8)
             }
             else {
-                0.5
+                ("candidate", 0.5)
             };
             gate_constraints.push(GateConstraint {
                 source_pc: *source_pc,
@@ -1236,10 +1465,82 @@ impl RoleCollector {
                 confirmed,
                 weak,
                 unobserved: tally.unobserved,
+                state: state_name,
                 confidence,
             });
         }
         gate_constraints.sort_by_key(|g| (g.stream, g.offset_range, g.mask));
+
+        // The same join, second user: where the pooled constants came from.
+        let mut pool_fields: BTreeMap<(StreamKey, (u32, u32), u64), u32> = BTreeMap::new();
+        let mut ascii_pool_by_stream: BTreeMap<StreamKey, u32> = BTreeMap::new();
+        for (compare_pc, value, sources) in &state.pool_events {
+            let Some((stream, offset_range)) = span_of(&state, sources) else { continue };
+            *pool_fields.entry((stream, offset_range, *compare_pc)).or_insert(0) += 1;
+            if (0x20..0x7f).contains(value) {
+                *ascii_pool_by_stream.entry(stream).or_insert(0) += 1;
+            }
+        }
+        let pool_fields: Vec<PoolField> = pool_fields
+            .into_iter()
+            .map(|((stream, offset_range, compare_pc), events)| PoolField {
+                stream,
+                offset_range,
+                compare_pc,
+                events,
+            })
+            .collect();
+
+        // Gate and magic on the same bytes: reported, never arbitrated.  A byte can
+        // carry both statements, so this is a list to inspect -- the two cannot both
+        // be "the value this byte must hold", and a model that emits both has
+        // conflated two consumers.
+        let mut field_collisions = Vec::new();
+        for gate in &gate_constraints {
+            for entry in role_map.entries.iter().filter(|e| e.role == Role::Magic) {
+                if entry.stream != gate.stream
+                    || entry.offset_range.0 >= gate.offset_range.1
+                    || gate.offset_range.0 >= entry.offset_range.1
+                {
+                    continue;
+                }
+                for value in &entry.discriminants {
+                    // The comparison that stated it: any asserted site on this
+                    // stream that reported the same value.
+                    let compare_pc = state
+                        .magic_sites
+                        .iter()
+                        .find(|site| site.source.addr == entry.stream && site.value == *value)
+                        .map(|site| site.compare_pc)
+                        .unwrap_or(0);
+                    field_collisions.push(FieldCollision {
+                        stream: gate.stream,
+                        offset_range: gate.offset_range,
+                        gate_mask: gate.mask,
+                        branch_pc: gate.branch_pc,
+                        magic_value: *value,
+                        compare_pc,
+                    });
+                }
+            }
+        }
+        field_collisions.sort();
+        field_collisions.dedup();
+
+        // Per-stream counters the profile needs, taken while `state` is still
+        // borrowed: the class is computed after the stream constraints exist.
+        let mut gate_samples_by_stream: BTreeMap<StreamKey, u32> = BTreeMap::new();
+        for ((_, stream, _), tally) in &state.gate_samples {
+            let samples =
+                tally.stores + tally.device_writes + tally.unobserved + tally.reads.values().sum::<u32>();
+            *gate_samples_by_stream.entry(*stream).or_insert(0) += samples;
+        }
+        let mut compares_by_stream: BTreeMap<StreamKey, u32> = BTreeMap::new();
+        let mut sites_by_stream: BTreeMap<StreamKey, BTreeSet<u64>> = BTreeMap::new();
+        for site in &state.magic_sites {
+            *compares_by_stream.entry(site.source.addr).or_insert(0) += 1;
+            sites_by_stream.entry(site.source.addr).or_default().insert(site.source.pc);
+        }
         drop(state);
 
         // A dispatching comparison chain (`cmp #0xe100` ... `cmp #0x1c200`) shows
@@ -1263,7 +1564,9 @@ impl RoleCollector {
         for (stream, offset_range, confidence) in derived_payload {
             role_map.insert(RoleEntry::new(stream, offset_range, Role::Payload, confidence));
         }
-        upgrade_consumed_payload(&mut role_map);
+        // `upgrade_consumed_payload` is deliberately not called here: it promotes by
+        // *stream*, and the set that says a stream is a device register only exists
+        // once the profiles are computed (see the call after the budget below).
 
         // A constant the firmware tests against *every* byte of a stream is a
         // delimiter, not a positional field.  Coverage is measured over the bytes of
@@ -1319,6 +1622,212 @@ impl RoleCollector {
                 .all(|value| stream_level.contains(&(entry.stream, *value)));
         }
 
+        // Per-stream profile: six features, all of them counts over evidence the
+        // pass already emits, and the class this run's evidence supports.  The
+        // *verdict* is not decided here -- a stream whose profile flips between
+        // seeds cannot be a data channel (its meaning would depend on the input),
+        // so the stable classification belongs to the aggregate
+        // (`_channel_model.py`).
+        //
+        // The class thresholds: two or more independent channel signs is a
+        // channel at 0.8, one is a channel at 0.6, the config-flag shape (or any
+        // sink at all, which means the firmware touched it) is a register at 0.6,
+        // and everything else is undecided at 0.5 -- all values already in the
+        // pass's confidence ladder.
+        let constraint_values: BTreeSet<(StreamKey, u64)> =
+            stream_constraints.iter().map(|c| (c.stream, c.value)).collect();
+        let mut stream_profiles = Vec::new();
+        for (stream, bytes) in bytes_by_stream.iter() {
+            let entries: Vec<&RoleEntry> =
+                role_map.entries.iter().filter(|e| e.stream == *stream).collect();
+            let contract_magic = entries
+                .iter()
+                .filter(|e| e.role == Role::Magic && !e.discriminants.is_empty())
+                .count() as u32;
+            let contract_length = entries.iter().filter(|e| e.role == Role::Length).count() as u32;
+            let mut values: BTreeSet<u64> = BTreeSet::new();
+            let mut positions: BTreeSet<u32> = BTreeSet::new();
+            let mut positional = 0u32;
+            for entry in entries.iter().filter(|e| e.role == Role::Magic) {
+                // Only *asserted* constants count as structure.  This loop runs
+                // before the prune, so an entry whose every comparison was demoted
+                // is still in the map here -- and on the target the ISR has three
+                // such entries, which made `positions.len() >= 2` true and turned a
+                // device register into a channel at 0.6.
+                if entry.discriminants.is_empty() {
+                    continue;
+                }
+                positions.insert(entry.offset_range.0);
+                for value in &entry.discriminants {
+                    values.insert(*value);
+                    if !constraint_values.contains(&(*stream, *value)) {
+                        positional += 1;
+                    }
+                }
+            }
+            // The line-discipline alphabet this target's console uses.
+            const ALPHABET: [u64; 7] = [0x0a, 0x0d, 0x7f, 0x20, 0x22, 0x27, 0x5c];
+            let terminators = ALPHABET.iter().filter(|c| values.contains(c)).count() as u32;
+            let ascii_pool = ascii_pool_by_stream.get(stream).copied().unwrap_or(0);
+            // A buffer the firmware fills and reads back: a length *read from this
+            // stream* bounding this stream's own reads, and a store on it.
+            //
+            // Requiring `source == target` is what keeps this from firing on a gate
+            // sweep over a register: the ISR's bounds come from the console stream
+            // (a gate that stayed live across the handler), which says nothing
+            // about the register being a buffer.  A cross-stream length/payload
+            // pair is not recognised here -- the other signs have to carry it --
+            // because distinguishing it from a sweep needs the store/load round
+            // trip, which the role map does not record.
+            let ring_bounds = loop_bounds
+                .iter()
+                .filter(|b| {
+                    b.target.addr == *stream
+                        && b.source.addr == *stream
+                        && b.gated_count > 0
+                        && reasons.get(stream).map_or(false, |r| r.contains("store"))
+                })
+                .count() as u32;
+            let gate_masks = gate_samples_by_stream.get(stream).copied().unwrap_or(0);
+            let compares = compares_by_stream.get(stream).copied().unwrap_or(0);
+            // One value, one site, one position, no alphabet: the clock-enable shape.
+            //
+            // "No positional structure" cannot be `positional == 0`: a single
+            // constant on a single byte is one positional discriminant and still
+            // has no *structure*.  What distinguishes a flag is that there is only
+            // one position and one site to speak of -- a field is several.
+            let sites = sites_by_stream.get(stream).map_or(0, |s| s.len());
+            let flag_constant = contract_magic > 0
+                && values.len() == 1
+                && positions.len() == 1
+                && sites == 1
+                && terminators == 0
+                && ascii_pool == 0
+                && contract_length == 0;
+            // A channel sign is *structure*, not merely "a constant exists": several
+            // positions carrying constants, or a delimiter class.  A single
+            // constant is the flag shape above, which is checked first.
+            let has_constraint = stream_constraints.iter().any(|c| c.stream == *stream);
+            let signs = u32::from(positions.len() >= 2 || has_constraint)
+                + u32::from(contract_length > 0)
+                + u32::from(terminators >= 3)
+                + u32::from(ascii_pool >= 2)
+                + u32::from(ring_bounds > 0);
+            // The config-flag shape is checked *first*: it has a magic sink like a
+            // channel does, but one constant on one site with no positional
+            // structure is the firmware checking its own state (the clock-enable
+            // compare), not a field of a protocol.  Without this order the flag
+            // shape would be reported as a channel at 0.6.
+            let (class, confidence) = if flag_constant {
+                ("register", 0.6)
+            }
+            else if signs >= 2 {
+                ("channel", 0.8)
+            }
+            else if signs == 1 {
+                ("channel", 0.6)
+            }
+            else if reasons.contains_key(stream) {
+                ("register", 0.6)
+            }
+            else {
+                ("undecided", 0.5)
+            };
+            stream_profiles.push(StreamProfile {
+                stream: *stream,
+                reads: reads_by_stream.get(stream).copied().unwrap_or(0),
+                bytes: *bytes,
+                contract_magic,
+                contract_length,
+                positional_magic: positional,
+                terminators,
+                ascii_pool,
+                ring_bounds,
+                gate_masks,
+                compares,
+                flag_constant,
+                class,
+                confidence,
+            });
+        }
+        stream_profiles.sort_by_key(|p| p.stream);
+
+        // The profile has the last word on the budget.
+        //
+        // The three classes above are decided by *sinks*, and a store is not a
+        // contract: on the target the USART status register is polled, stored into
+        // the driver's ring buffer and read back through a table load, which made
+        // 589 bytes of device status count as protocol input -- against the 132
+        // bytes a comparison actually judged.  The profile has already decided what
+        // the stream *is*, from six independent features, so a stream it calls a
+        // register is device state no matter what downstream code did with one of
+        // its reads.  Reporting a protocol share the analysis itself contradicts is
+        // worse than reporting a smaller one: it is the number the paper argues
+        // from ("device state eats N% of the input"), so it has to be the number the
+        // classification supports.
+        //
+        // Only the register class *without a contract of its own* is moved: the
+        // flag-constant shape (one constant, one site, one position, i.e. the
+        // firmware checking its own state) is a register by class but still carries
+        // a magic role, and a stream whose bytes the firmware compared against a
+        // constant was judged whatever else the profile thinks of it.  What this removes is
+        // exactly the sink-only evidence: a store or a table load on a stream
+        // nothing was ever asserted about is the driver handling a register, not a
+        // contract on the input.  A store-only stream is left alone entirely -- a
+        // copy is a copy, and it belongs in `consumed_bytes`.
+        //
+        // Deliberately *not* redone: the gate classification above asks the same
+        // question ("is this stream data?") of the sink-based set, and re-deriving
+        // it would mean re-running `state.gate_samples` after `state` is gone.  On
+        // the target it cannot move anything -- the one gate has no confirmed
+        // samples at all, so reclassifying its reads as device can only lower
+        // `confirmed`, which is already zero -- and a gate whose consequences are
+        // register polls stays a candidate at 0.5 either way.
+        let register_shaped: BTreeSet<StreamKey> = stream_profiles
+            .iter()
+            .filter(|profile| {
+                profile.class == "register"
+                    && profile.contract_magic == 0
+                    && profile.contract_length == 0
+            })
+            .map(|profile| profile.stream)
+            .collect();
+        if !register_shaped.is_empty() {
+            let (mut judged_bytes, mut moved_bytes, mut device_bytes) = (0_u64, 0_u64, 0_u64);
+            let mut devices: Vec<StreamKey> = Vec::new();
+            for (stream, bytes) in bytes_by_stream.iter() {
+                if judged.contains(stream) && !register_shaped.contains(stream) {
+                    judged_bytes += *bytes;
+                }
+                else if moved.contains(stream) {
+                    moved_bytes += *bytes;
+                }
+                else {
+                    device_bytes += *bytes;
+                    devices.push(*stream);
+                }
+            }
+            devices.sort_unstable();
+            // A moved stream stays a data stream even when the profile calls it a
+            // register: the byte was copied, so it is not device state, and only
+            // the judged class is what the profile overrides.
+            counters.data_streams = judged.difference(&register_shaped).count() + moved.len();
+            counters.protocol_bytes = judged_bytes;
+            counters.consumed_bytes = moved_bytes;
+            counters.device_state_bytes = device_bytes;
+            counters.device_state_streams = devices.len();
+            device_state_streams = devices;
+        }
+
+        // Promote long runs of consumed-but-unclassified bytes to payload -- but not
+        // on a stream the profile calls a register.  The rule is purely per-stream,
+        // so it has exactly the failure mode the per-read marking had before it
+        // became a property of the relation: on the target it promoted 16 bytes of
+        // USART status register (the handler masks the status byte and stores it)
+        // into the payload.  It runs here because this is the first point where the
+        // profile's verdict exists.
+        upgrade_consumed_payload(&mut role_map, &register_shaped);
+
         // A magic role with nothing asserted about it is not a role: every
         // comparison that produced it was demoted (a pointer, a boundary of a
         // derived value, or a flag), so there is no claim left to make.  The raw
@@ -1363,6 +1872,9 @@ impl RoleCollector {
             magic_sites,
             stream_constraints,
             gate_constraints,
+            pool_fields,
+            field_collisions,
+            stream_profiles,
             sink_sites,
             checksum_sites,
             device_state_streams,
@@ -1376,10 +1888,19 @@ impl RoleCollector {
         let mut state = self.state.borrow_mut();
         let site = (context.pc, context.addr);
         let expected = state.expected_offset.get(&site).copied().unwrap_or(0);
-        let Some(record) = self.ledger.take_next(context.pc, context.addr, expected) else {
+        let (record, occurrence_matched) =
+            self.ledger.take_occurrence(context.pc, context.addr, context.occ, expected);
+        let Some(record) = record else {
             state.unbound_loads += 1;
             return;
         };
+        // The record is the execution's own count for this site; the analysis asked
+        // for its own.  A disagreement means the two sides stopped seeing the same
+        // reads, and the fragment that follows is attributed to the wrong
+        // occurrence -- which positional matching alone could never have reported.
+        if !occurrence_matched {
+            state.occ_mismatches += 1;
+        }
         if record.size != size {
             state.size_mismatches += 1;
         }
@@ -1510,6 +2031,15 @@ impl PhaseBObserver for RoleCollector {
                 });
             }
         }
+        if evidence.from_pool {
+            // Kept for the projection: which input bytes did this pooled constant
+            // come from.  Recorded here rather than counted, because the join to
+            // offsets only exists in `output()` (it needs the bound fragments).
+            self.state
+                .borrow_mut()
+                .pool_events
+                .push((evidence.compare_pc, value, sources.to_vec()));
+        }
         // The compared constant is what the firmware expects to read, so it is a
         // discriminant of these bytes -- captured at the comparison, with no
         // branch or gating bookkeeping in between.
@@ -1544,6 +2074,25 @@ impl PhaseBObserver for RoleCollector {
         // Only the source is consumption evidence: the target is *bounded* by the
         // length, and on this target that included the status register the gate
         // was polled through, which is not data.
+        //
+        // Whether the *target* is that field's payload is a property of this
+        // relation, not of the target's stream, so it is decided here (the source's
+        // occurrences are only available here) and recorded for the bounded reads
+        // that follow: same stream as the field, or the field's value equal to how
+        // many times the target was read.
+        let same_stream = source.addr == target.addr;
+        let confirmed_by_value = source_occs.iter().any(|occ| {
+            self.state
+                .borrow()
+                .fragments
+                .get(&(source.pc, source.addr, *occ))
+                .map(|fragment| fragment.value == count)
+                .unwrap_or(false)
+        });
+        self.state
+            .borrow_mut()
+            .bound_payload
+            .insert((source, target), same_stream || confirmed_by_value);
         self.note_sinks(&[source], "length");
         for occ in source_occs {
             let read = AccessContext::at(source.pc, source.addr, *occ);
@@ -1551,27 +2100,38 @@ impl PhaseBObserver for RoleCollector {
         }
     }
 
-    fn on_bounded_read(&mut self, read: AccessContext) {
+    fn on_bounded_read(&mut self, source: AccessContext, target: AccessContext, read: AccessContext) {
         // A byte read while a length field was in effect is part of the payload
-        // that length paid for -- but only if its stream is one the firmware
-        // consumes as data at all.
+        // that length paid for -- but "the stream had a sink somewhere" is not
+        // enough to say so, because one stream can be read in two contexts with two
+        // meanings.  The decision is therefore about *this* relation:
         //
-        // A gate stays in effect across everything that runs while it is live,
-        // and on the target that included the interrupt handler's own register
-        // polls: 363 reads of ISR/ICR/CR1 were "bounded" by a gate opened on the
-        // console stream, and marking them payload turned the device-state budget
-        // into protocol bytes.  A read whose stream never reaches a sink is the
-        // firmware looking at its own device, so it is counted and dropped.
+        //   * the bound's source and target are the same stream (the
+        //     `[MAGIC][LEN][PAYLOAD]` shape, where the field pays for its own
+        //     bytes), or
+        //   * the field's own value equals how many times the target was read (the
+        //     same confirmation the length's confidence uses, which is what
+        //     separates a cross-stream length pair from a sweep).
         //
-        // The sink set is complete by the time bounded reads are reported: they
-        // come from `emit_observations`, which runs after every magic, checksum,
-        // store and table-load event of the pass.  The bound's own source is
-        // marked as a sink just before its bounded reads (see `on_loop_bound`), so
-        // the common single-stream shape -- `[MAGIC][LEN][PAYLOAD]` -- always
-        // keeps its payload even if nothing else noted the stream.
+        // and the read's stream must still be one the firmware consumes as data at
+        // all.  On the target the console byte gates the interrupt handler's
+        // register polls -- 589 bytes of ISR status -- and a stream-level test
+        // marked every one of them payload, which is the budget this fix reclaims.
+        // The sink set is complete by the time bounded reads are reported: they come
+        // from `emit_observations`, after every magic, checksum, store and
+        // table-load event of the pass.
+        let payload_relation = self
+            .state
+            .borrow()
+            .bound_payload
+            .get(&(source, target))
+            .copied()
+            .unwrap_or(false);
         let is_data_stream = {
             let mut state = self.state.borrow_mut();
-            if state.sink_sites.iter().any(|(_, stream, _)| *stream == read.addr) {
+            if payload_relation
+                && state.sink_sites.iter().any(|(_, stream, _)| *stream == read.addr)
+            {
                 state.bounded_reads_marked += 1;
                 true
             }
@@ -1680,6 +2240,33 @@ pub fn save_role_map(path: &std::path::Path, output: &RoleMapOutput) -> anyhow::
     Ok(())
 }
 
+/// The input span a set of read sites covers, and the stream it is on.
+///
+/// One join, two users: the gate projection (`(site, mask) -> offset`) and the
+/// pool projection (`compare_pc -> stream, offset`) ask the same question --
+/// "which input bytes is this event about" -- so they share this.
+///
+/// `None` when no source is bound, or when the sources span more than one stream:
+/// a projection onto two streams would have to pick one, and picking is how a
+/// model silently loses a consumer.
+fn span_of(state: &RoleCollectorState, sources: &[AccessContext]) -> Option<(StreamKey, (u32, u32))> {
+    let mut span: Option<(StreamKey, (u32, u32))> = None;
+    for source in sources {
+        let Some(fragment) = state.fragments.get(&(source.pc, source.addr, source.occ)) else {
+            continue;
+        };
+        span = match span {
+            None => Some((source.addr, fragment.offset_range)),
+            Some((stream, (start, end))) if stream == source.addr => {
+                Some((stream, (start.min(fragment.offset_range.0), end.max(fragment.offset_range.1))))
+            }
+            // A second stream among the sources: ambiguous, so not projected.
+            Some(_) => return None,
+        };
+    }
+    span
+}
+
 /// Width, in bytes, of one read of `target`.
 ///
 /// Prefers the first occurrence, falling back to the lowest occurrence that was
@@ -1705,7 +2292,16 @@ fn target_width(state: &RoleCollectorState, target: AccessContext) -> u32 {
 /// A byte copied out of a buffer without ever being compared or used as a bound
 /// still only ever ends up labelled `Propagated`; when several such bytes sit
 /// next to each other they are, in aggregate, the payload.
-fn upgrade_consumed_payload(map: &mut RoleMap) {
+///
+/// "In aggregate, on one stream" is a weak claim -- which is why the streams the
+/// profile classifies as registers are excluded.  A device register read, masked
+/// and stored, produces the same run of `Propagated` bytes as a payload buffer
+/// does, and the run's stream is the only thing this rule can see.  Those runs are
+/// *dropped* rather than promoted: the bytes were consumed, but on a device-side
+/// stream they are the firmware reading itself, and leaving them as
+/// `Propagated` would put a device register back into the role map under a weaker
+/// name.
+fn upgrade_consumed_payload(map: &mut RoleMap, device_side: &BTreeSet<StreamKey>) {
     let mut additions = Vec::new();
     let mut covered = Vec::new();
     for stream in map.streams() {
@@ -1731,11 +2327,16 @@ fn upgrade_consumed_payload(map: &mut RoleMap) {
         for run in runs {
             if run.1.saturating_sub(run.0) > 4 {
                 covered.push((stream, run));
-                additions.push(RoleEntry::new(stream, run, Role::Payload, 0.8));
+                if !device_side.contains(&stream) {
+                    additions.push(RoleEntry::new(stream, run, Role::Payload, 0.8));
+                }
             }
         }
     }
-    if additions.is_empty() {
+    // The retain has to run whenever a run was found, not only when something was
+    // promoted: a device-side run has no replacement entry, and skipping the drop
+    // would leave it in the map.
+    if covered.is_empty() {
         return;
     }
     map.entries.retain(|entry| {
@@ -1824,11 +2425,16 @@ mod tests {
         ledger.record(0x100, 0x4000, 0, &[0x41], Default::default());
         ledger.record(0x100, 0x4000, 1, &[0x41], Default::default());
 
-        let first = ledger.take_next(0x100, 0x4000, 0).expect("first read");
+        let (first, matched) = ledger.take_occurrence(0x100, 0x4000, 1, 0);
+        let first = first.expect("first read");
         assert_eq!(first.input_offset, 0);
-        let second = ledger.take_next(0x100, 0x4000, 1).expect("second read");
+        assert_eq!(first.occ, 1, "the occurrence is stamped where the read happened");
+        assert!(matched, "the first read of the site is occurrence 1");
+        let (second, matched) = ledger.take_occurrence(0x100, 0x4000, 2, 1);
+        let second = second.expect("second read");
         assert_eq!(second.input_offset, 1);
-        assert!(ledger.take_next(0x100, 0x4000, 2).is_none());
+        assert!(matched, "occurrence 2 is what the execution recorded");
+        assert!(ledger.take_occurrence(0x100, 0x4000, 3, 2).0.is_none());
     }
 
     #[test]
@@ -1839,8 +2445,10 @@ mod tests {
         ledger.record(0x100, 0x4000, 7, &[3], Default::default());
 
         // A pass that starts at offset 7 must skip the two stale records.
-        let record = ledger.take_next(0x100, 0x4000, 7).expect("record at 7");
+        let (record, matched) = ledger.take_occurrence(0x100, 0x4000, 3, 7);
+        let record = record.expect("record at 7");
         assert_eq!(record.input_offset, 7);
+        assert!(matched, "the third read of the site is the one at offset 7");
     }
 
     #[test]
@@ -1949,7 +2557,11 @@ mod tests {
             4,
             4,
         );
-        collector.on_bounded_read(device);
+        collector.on_bounded_read(
+            AccessContext::site(0x200, 0x5800_0008),
+            AccessContext::site(0x300, 0x4001_381c),
+            device,
+        );
 
         let output = collector.output(1);
         assert_eq!(output.report.bounded_reads_marked, 0);
@@ -1981,7 +2593,11 @@ mod tests {
             4,
             4,
         );
-        collector.on_bounded_read(AccessContext::at(0x300, stream, 1));
+        collector.on_bounded_read(
+            AccessContext::site(0x200, stream),
+            AccessContext::site(0x300, stream),
+            AccessContext::at(0x300, stream, 1),
+        );
 
         let output = collector.output(1);
         assert_eq!(output.report.bounded_reads_marked, 1);
@@ -2496,12 +3112,18 @@ mod tests {
         assert_eq!(gate.stream, 0x4000);
         assert_eq!(gate.offset_range, (0, 1), "the tested byte");
         assert_eq!((gate.confirmed, gate.weak, gate.unobserved), (2, 1, 0));
-        assert_eq!(gate.confidence, 0.6, "a weak sample is not a confirmation");
+        assert_eq!(
+            gate.state, "candidate",
+            "a weak sample means report it, do not fix it"
+        );
+        assert_eq!(gate.confidence, 0.5, "a weak sample is not a confirmation");
     }
 
-    /// Two samples are not a coverage claim, here as everywhere else.
+    /// Two samples are not enough to *fix* a gate, but they are enough to report
+    /// it as a candidate: suppressing it threw away the one piece of evidence that
+    /// says which bit and which branch, on a run that had found a real gate.
     #[test]
-    fn gate_constraint_needs_enough_samples() {
+    fn gate_constraint_needs_enough_samples_to_be_confirmed() {
         let ledger = ReadLedger::new();
         ledger.record(0x100, 0x4000, 0, &[0x20], Default::default());
 
@@ -2520,11 +3142,128 @@ mod tests {
 
         let output = collector.output(1);
         assert_eq!(output.report.gate_tests, 2);
-        assert!(
-            output.gate_constraints.is_empty(),
-            "two samples is not enough: {:?}",
-            output.gate_constraints
+        assert_eq!(output.gate_constraints.len(), 1, "{:?}", output.gate_constraints);
+        let gate = output.gate_constraints[0];
+        assert_eq!(gate.confirmed, 2);
+        assert_eq!(
+            gate.state, "candidate",
+            "reported, but not confirmed: fixing needs {MIN_GATE_SAMPLES} samples"
         );
+        assert_eq!(gate.confidence, 0.5, "the candidate tier, not the confirmed one");
+
+        // ... and the threshold still means something: three confirmed samples are
+        // a confirmed gate.
+        collector.on_gate_test(
+            &[source],
+            0x20,
+            0x204,
+            GateOutcome::Read { pc: 0x300, addr: 0x4000 },
+        );
+        let output = collector.output(1);
+        assert_eq!(output.gate_constraints[0].state, "confirmed");
+        assert_eq!(output.gate_constraints[0].confidence, 0.8);
+    }
+
+    /// The flag-constant shape is a register even though it carries a magic sink;
+    /// a stream with positional constants *and* the terminator alphabet is a
+    /// channel.  Getting this order wrong reports every config compare as a
+    /// channel at 0.6.
+    #[test]
+    fn stream_profile_separates_channel_from_register() {
+        let ledger = ReadLedger::new();
+        // A console-like stream: three positions, each compared against constants
+        // that vary by position, including three alphabet members.
+        for (offset, value) in [(0u32, 0x0du8), (1, 0x0a), (2, 0x20)] {
+            ledger.record(0x200, 0x4000, offset, &[value], Default::default());
+        }
+        // A config-flag stream: one byte, one constant, nothing else.
+        ledger.record(0x300, 0x4004, 0, &[0x41], Default::default());
+
+        let mut collector = RoleCollector::new(ledger, SinkClassifier::new());
+        for (offset, value) in [(0u32, 0x0du8), (1, 0x0a), (2, 0x20)] {
+            let read = AccessContext::at(0x200, 0x4000, offset + 1);
+            collector.on_source_load(read, 1);
+            collector.on_magic_compare(&[read], value as u64, 0.85, MagicEvidence::at(0x210));
+        }
+        let flag = AccessContext::new(0x300, 0x4004);
+        collector.on_source_load(flag, 1);
+        collector.on_magic_compare(&[flag], 0x41, 0.85, MagicEvidence::at(0x310));
+
+        let output = collector.output(1);
+        let by_stream: BTreeMap<_, _> =
+            output.stream_profiles.iter().map(|p| (p.stream, p)).collect();
+        let console = by_stream.get(&0x4000).expect("console profile");
+        assert_eq!(console.class, "channel");
+        assert_eq!(console.contract_magic, 3);
+        assert_eq!(console.terminators, 3, "\\r, \\n and space are all in the values");
+        assert!(console.confidence >= 0.8, "two independent signs: {console:?}");
+
+        let config = by_stream.get(&0x4004).expect("config profile");
+        assert_eq!(config.class, "register", "one constant on one site: {config:?}");
+        assert!(config.flag_constant);
+    }
+
+    /// The pool projection uses the same `site -> offset` join as the gate one.
+    #[test]
+    fn pooled_constants_are_projected_onto_their_input_bytes() {
+        let ledger = ReadLedger::new();
+        ledger.record(0x100, 0x4000, 0, &[0x6c], Default::default());
+
+        let mut collector = RoleCollector::new(ledger, SinkClassifier::new());
+        let source = AccessContext::new(0x100, 0x4000);
+        collector.on_source_load(source, 1);
+        collector.on_magic_compare(
+            &[source],
+            0x6c,
+            0.6,
+            MagicEvidence { compare_pc: 0x800430a, from_fallback: false, from_pool: true },
+        );
+
+        let output = collector.output(1);
+        assert_eq!(
+            output.pool_fields,
+            vec![PoolField {
+                stream: 0x4000,
+                offset_range: (0, 1),
+                compare_pc: 0x800430a,
+                events: 1,
+            }],
+            "{:?}",
+            output.pool_fields
+        );
+    }
+
+    /// A gate and a magic on the same byte are reported, not arbitrated.
+    #[test]
+    fn gate_and_magic_on_one_byte_are_reported() {
+        let ledger = ReadLedger::new();
+        ledger.record(0x100, 0x4000, 0, &[0x41], Default::default());
+
+        let mut collector = RoleCollector::new(ledger, SinkClassifier::new());
+        let source = AccessContext::new(0x100, 0x4000);
+        collector.on_source_load(source, 1);
+        collector.on_magic_compare(&[source], 0x41, 0.85, MagicEvidence::at(0x200));
+        for _ in 0..3 {
+            collector.on_gate_test(
+                &[source],
+                0x20,
+                0x204,
+                GateOutcome::Read { pc: 0x300, addr: 0x4000 },
+            );
+        }
+
+        let output = collector.output(1);
+        assert_eq!(output.gate_constraints.len(), 1);
+        assert_eq!(output.gate_constraints[0].state, "confirmed", "every sample consumed input");
+        assert_eq!(output.gate_constraints[0].mask, 0x20);
+        assert_eq!(
+            output.field_collisions.len(),
+            1,
+            "the two statements are on the same byte: {:?}",
+            output.field_collisions
+        );
+        assert_eq!(output.field_collisions[0].magic_value, 0x41);
+        assert_eq!(output.field_collisions[0].gate_mask, 0x20);
     }
 
     /// A comparison the engine demoted is evidence, not a contract: it stays in

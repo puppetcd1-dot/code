@@ -361,11 +361,17 @@ fn replay_trace(mut vm: Vm, mut target: CortexmMultiStream) -> anyhow::Result<()
         crate::semantic_taint::save_reads("semantic_reads.jsonl".as_ref(), &ledger.records())?;
         crate::semantic_taint::save_role_map("role_map.json".as_ref(), &output)?;
 
-        // Both sides count the same thing from different places; any difference
-        // means interpretation and execution diverged, which would also mean the
-        // fragments are attributed to the wrong reads.
-        let occ_mismatches =
+        // Two different checks, answering different questions:
+        //   * `loads_skew` is a *count*: interpretation claimed a different number of
+        //     MMIO reads than the collector saw, so the two sides diverged somewhere;
+        //   * `occ_mismatch` is per fragment: the ledger's own occurrence for the
+        //     read was not the one the analysis asked for, so that fragment's bytes
+        //     belong to a different read than the one that consumed them.  A
+        //     positional queue cannot see this at all -- it hands over the next
+        //     record and looks consistent.
+        let loads_skew =
             (counters.loads_interpreted as i64 - collector.loads_observed() as i64).abs();
+        let occ_mismatches = collector.occ_mismatches();
         let unconsumed = ledger.pending();
         // Fingerprint of an unmodelled checksum: one magic comparison whose
         // provenance spans many read sites.
@@ -432,13 +438,15 @@ fn replay_trace(mut vm: Vm, mut target: CortexmMultiStream) -> anyhow::Result<()
         //     They are read while the bound is in effect, but they are not the
         //     payload the bound was about, so they produce no payload role.
         eprintln!(
-            "[taint] reads={} sites={} fragments={} roles={} blocks={} stores={} \
+            "[taint] schema={} reads={} sites={} fragments={} roles={} blocks={} stores={} \
              magic={} loop_bounds={} checksum={} table_loads={} bounded_reads={} \
              skipped_space={} stack_skipped={} unbound={} width_mismatch={} occ_mismatch={} \
              early_stops={} unconsumed={} dropped_sites={} leftovers={} demoted={} \
              pool_discriminants={} pruned_magic={} device_writes={} panic_disarmed={} \
              magic_max_width={} checksum_rejected={} bounded_reads_device={} \
-             stores_value_unknown={}",
+             stores_value_unknown={} gate_masks={} gate_tests={} gate_exits={} \
+             gate_near_misses={} unmodelled_tainted={} phase_b={} loads_skew={}",
+            output.report.schema,
             output.report.mmio_reads,
             output.report.read_sites,
             output.report.source_fragments,
@@ -467,7 +475,14 @@ fn replay_trace(mut vm: Vm, mut target: CortexmMultiStream) -> anyhow::Result<()
             magic_max_width,
             output.report.rejected_checksum_events,
             output.report.device_state_bounded_reads,
-            output.report.store_values_unknown
+            output.report.store_values_unknown,
+            counters.test_masks_derived,
+            output.report.gate_tests,
+            counters.gate_exits_tainted,
+            counters.gate_near_misses,
+            counters.unmodelled_ops_tainted,
+            crate::phase_b::PHASE_B_REVISION,
+            loads_skew
         );
         // The demotion total is an argument only when split: which mechanism took
         // the constant away (a negated add form, a ones-run at the comparison's
@@ -489,6 +504,45 @@ fn replay_trace(mut vm: Vm, mut target: CortexmMultiStream) -> anyhow::Result<()
                 .map(|(pc, n)| format!("{pc:#x}:{n}"))
                 .collect();
             eprintln!("[taint] pool discriminants by site: {}", parts.join(" "));
+        }
+        // Where a bit test that never became a gate broke.  The aggregate
+        // (`gate_near_misses`) says how many blocks were in that state; only the
+        // split says which of the four links is missing, and they need different
+        // fixes.
+        if !counters.gate_near_miss_by_reason.is_empty() {
+            let parts: Vec<String> = counters
+                .gate_near_miss_by_reason
+                .iter()
+                .map(|(why, n)| format!("{why}:{n}"))
+                .collect();
+            eprintln!("[taint] gate near misses by reason: {}", parts.join(" "));
+        }
+        // Gates that only the register-scoped view could explain: the measure of
+        // what the cross-block fallback buys (and of how much the run depends on
+        // it, since that view is not scoped to the function the test came from).
+        if counters.gate_test_from_regs > 0 {
+            eprintln!(
+                "[taint] gate tests from register-scoped bit tests: {}",
+                counters.gate_test_from_regs
+            );
+        }
+        // A condition that reached its branch with no bit test, with the chain of
+        // operations that defined it and the mask the rules would have inferred.
+        // The next engine fix is read off this table: the chain names the arm that
+        // drops the bit test, and `would-be mask` saying a bit of the *input* byte
+        // means the exit can consult the mask rules as a last resort, while a mask
+        // on an intermediate value's top bit means the bit has to be pulled back
+        // through the chain that produced it.
+        if !counters.gate_near_miss_nodes.is_empty() {
+            let mut nodes = counters.gate_near_miss_nodes.clone();
+            nodes.sort_by_key(|(_, _, _, _,_, count)| std::cmp::Reverse(*count));
+            eprintln!("[taint] conditions with no bit test (branch <- definer):");
+            for (branch, def, chain, size, mask, count) in nodes.iter() {
+                eprintln!(
+                    "[taint]   {:#x} <- {:#x} [{chain}] width={} would-be mask {:#x}: {}",
+                    *branch, *def, *size, *mask, *count
+                );
+            }
         }
         // The bits the firmware branches on.  A gate with high coverage is a
         // constraint ("do not randomise this bit"); a weak one is the firmware

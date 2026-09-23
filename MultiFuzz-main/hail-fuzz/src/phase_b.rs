@@ -223,8 +223,18 @@ pub trait PhaseBObserver {
 
     /// One read of `target` that happened while a loop bound was in effect.
     ///
-    /// These are the bytes a length field pays for, i.e. the payload.
-    fn on_bounded_read(&mut self, _read: AccessContext) {}
+    /// The pair is passed because whether these bytes are the field's payload is a
+    /// property of the *relation*, not of the target's stream: one stream can be
+    /// read in two contexts, and a byte a length field paid for looks exactly like
+    /// a register a gate happened to still be live across.  `source` is a site
+    /// (`occ == 0`); the occurrences that opened gates are in `on_loop_bound`.
+    fn on_bounded_read(
+        &mut self,
+        _source: AccessContext,
+        _target: AccessContext,
+        _read: AccessContext,
+    ) {
+    }
 
     /// A load whose *address* derived from tainted input: a table lookup indexed
     /// by input bytes.  The value read out is clean, so without this the taint
@@ -440,6 +450,42 @@ fn classify_user_op(name: &str) -> UserOpKind {
     }
 }
 
+/// Revision of this engine's observable behaviour.
+///
+/// Bumped when what the engine *reports* changes (a derivative of
+/// `ANALYSIS_SCHEMA` for the engine side): 1, the gate miner as first shipped;
+/// 2, flag values excluded from the sign-bit fallback, register-space bit tests
+/// kept across blocks (`test_regs`), and the gate counters made meaningful
+/// (input-derived only, plus the tainted-exit population).
+/// 3, a bit-manipulation of a stamped value keeps the stamp (`flag ^ 1`, `flag &
+/// 1`) -- the shape the lifter uses for `bpl`/`bmi`-style conditions -- plus the
+/// counter for taint dropped by unmodelled ops.
+/// 4, the ops SLEIGH uses to slice and invert a value (`Subpiece`, `IntNot`,
+/// `BoolNot`, `IntNegate`, `Select`, the counting ops) are modelled instead of
+/// falling into the catch-all that defines its output clean -- and the two
+/// inversions keep the bit test, because `!N` is how `bpl` is written.
+/// 5, the exit looks a bit test up in the register-scoped view too -- it was the
+/// only consumer that read `def_test` alone, and the target's ISR branches on a
+/// test the previous block made -- and the near-miss population is split by where
+/// the chain broke instead of reported as one number.
+/// 6, a condition that reached its branch without a bit test names the chain of
+/// statements that defined it and the mask the rules would have inferred, because
+/// 729 of the target's 1109 near misses are that one shape and no counter said
+/// where it breaks.
+/// 7, the value-preserving copy carries the bit test *after* defining its
+/// destination -- it used to record it first, into the entry that `set_def` clears
+/// on the next line, which is why every flag computed in one statement and copied
+/// before the branch lost its gate (the target's four UART status polls among
+/// them).
+/// 8, the bounded-read callback names the bound's source and target, so the payload
+/// decision is about the relation -- the same stream as the field, or the field's
+/// value equal to the target's read count -- instead of about the target stream
+/// having a sink somewhere.
+///
+/// The artifacts carry it, so "did this build include that fix?" is a lookup
+/// rather than a deduction from counters that may not have moved.
+pub const PHASE_B_REVISION: u32 = 8;
+
 /// Upper bound on sub-block steps interpreted per group, guarding against an
 /// intra-group back-edge looping forever.  Groups are small (a handful of
 /// sub-blocks per guest instruction), so this is never reached in practice.
@@ -474,6 +520,15 @@ pub struct PhaseBEngine {
     /// Variables known to be a bit test of another value (see [`TestInfo`]), so a
     /// branch on them can be reported as "bit `mask` is watched".
     def_test: HashMap<VarId, TestInfo>,
+    /// The same, for *register*-space variables, remembered across blocks.
+    ///
+    /// `def_test` is block-local like the other derivation notes, but the lifter
+    /// routinely ends a block at the flag-setting instruction, so a bit test
+    /// computed in one block and branched on in the next would be lost -- the
+    /// target's ISR reads its status register in one block and branches on the
+    /// shifted sign in another.  Latest definition wins, exactly as `mixed_regs`
+    /// does it: redefining the register drops the old test.
+    test_regs: HashMap<VarId, TestInfo>,
     /// Variables known to be a shift of another value, which the sign test below
     /// turns back into the bit being watched.
     def_shift: HashMap<VarId, (Value, u8, bool)>,
@@ -482,6 +537,82 @@ pub struct PhaseBEngine {
     pending_gates: Vec<PendingGate>,
     /// Bit tests reported, for the report's counter.
     gate_tests: u64,
+    /// Block exits whose condition was input-derived: the population a gate can
+    /// come from.  Read against `gate_tests`: derived-and-exits-without-gates means
+    /// the stamp is lost between the test and the branch.
+    gate_exits_tainted: u64,
+    /// Masks recognised as a bit test, whether or not they reached a branch.
+    ///
+    /// Diagnostic pair with `gate_tests`: derived-but-never-reported means the mask
+    /// is lost between the test and the branch (the plumbing), while never-derived
+    /// means the derivation does not match the target's p-code at all.  A run has
+    /// to be able to tell those apart.
+    test_masks_derived: u64,
+    /// Blocks that *derived* a bit test and reported no gate.
+    ///
+    /// The decisive third number: `gate_masks` says the derivation works,
+    /// `gate_tests` says a gate came out, and this says how many blocks had a test
+    /// in hand and did not report one -- either the branch is not this block's exit
+    /// (a superblock ending in a call), or the condition is not the value the test
+    /// was computed into.
+    gate_near_misses: u64,
+    /// Why those blocks reported nothing, by where the chain broke.
+    ///
+    /// "The mask never reached a branch" has four different fixes -- the block has
+    /// no conditional exit at all, the exit condition is not input-derived, the
+    /// condition is a value no bit test was ever computed into, or the test was
+    /// found but carries no read to attribute a gate to -- and the aggregate
+    /// cannot tell them apart.  On the target this population is 1109 out of 1425
+    /// tainted exits, so which reason dominates decides what to fix next.
+    gate_near_miss_by_reason: BTreeMap<&'static str, u64>,
+    /// Gates reported from a bit test remembered at *register* scope only.
+    ///
+    /// The exit consults the register-scoped view as well, because the target's
+    /// ISR tests its status register in one block and branches on the shifted sign
+    /// in the next.  That view is not scoped to the block, so this counter is the
+    /// audit: a fallback that turns out to carry stale gates has to be bounded to
+    /// the window.
+    gate_test_from_regs: u64,
+    /// Where each variable was last defined, by guest PC.  Pass-scoped and
+    /// latest-definition-wins, like every other definition note.
+    ///
+    /// Read only by the diagnostic below: a condition that reached its branch with
+    /// no bit test cannot be fixed without knowing which statement made it.
+    def_pc: HashMap<VarId, u64>,
+    /// The same, as the operation that did the defining plus that operation's first
+    /// input, so the *chain* that produced a condition can be walked.
+    ///
+    /// This is a map of ops and not of derivation notes on purpose: a slice
+    /// (`Subpiece`) records nothing anywhere, so the notes alone cannot tell "an
+    /// unmodelled slice of a shift" from "a plain value", and those two need
+    /// opposite fixes.
+    def_op: HashMap<VarId, (pcode::Op, Value)>,
+    /// Conditions that reached a branch with no bit test, by (branch pc, defining
+    /// pc, the chain of ops that defined it, its width, the mask the mask rules
+    /// would have inferred).
+    ///
+    /// 729 of the target's 1109 near misses are this state, and they are the whole
+    /// difference between "the miner works and this firmware has no bit gates" and
+    /// "one arm of the chain is unmodelled".  The would-be mask is part of the key
+    /// because it also decides the fix: if it already names the bit of the *input*
+    /// byte, the exit can simply consult the mask rules as a last resort; if it
+    /// names a bit of an intermediate value (`(r5 << 26)` knows bit 31, the input
+    /// byte knows bit 5), the bit has to be pulled back through the chain that
+    /// produced it.
+    gate_near_miss_nodes: BTreeMap<(u64, u64, String, u8, u64), u64>,
+    /// Unmodelled ops whose inputs were tainted: the taint is dropped there.
+    ///
+    /// The catch-all arm defines its output `Clean`, which is the conservative
+    /// choice for *provenance* (better to lose a role than to invent one) -- but it
+    /// also means a branch condition computed through one of these ops is not
+    /// "tainted" at the exit, so it never enters `gate_exits_tainted` at all.  A
+    /// bit test the derivation recognised and that still produced no gate is this
+    /// number, not a plumbing bug.
+    unmodelled_ops_tainted: u64,
+    /// Whether a bit test was derived in the block being interpreted.
+    mask_in_block: bool,
+    /// Whether a gate was reported during the block being interpreted.
+    gate_reported_in_block: bool,
     /// Registers that hold a mixed value.  Unlike `def_mixed` this is scoped to
     /// the pass, not the block: a CRC accumulator is built inside a loop and
     /// compared after the loop has exited, in a different group, where the
@@ -627,9 +758,21 @@ impl PhaseBEngine {
             def_sub: HashMap::new(),
             def_mixed: HashSet::new(),
             def_test: HashMap::new(),
+            test_regs: HashMap::new(),
             def_shift: HashMap::new(),
             pending_gates: Vec::new(),
             gate_tests: 0,
+            test_masks_derived: 0,
+            gate_exits_tainted: 0,
+            gate_near_misses: 0,
+            gate_near_miss_by_reason: BTreeMap::new(),
+            gate_test_from_regs: 0,
+            def_pc: HashMap::new(),
+            def_op: HashMap::new(),
+            gate_near_miss_nodes: BTreeMap::new(),
+            unmodelled_ops_tainted: 0,
+            mask_in_block: false,
+            gate_reported_in_block: false,
             mixed_regs: HashSet::new(),
             def_masked: HashMap::new(),
             flag_vars: HashSet::new(),
@@ -749,11 +892,21 @@ impl PhaseBEngine {
         self.def_sub.clear();
         self.def_mixed.clear();
         self.def_test.clear();
+        self.test_regs.clear();
         self.def_shift.clear();
         // A pending bit test belongs to one pass: it is evidence about the code
         // that ran, and it must not survive into the next one.
         self.pending_gates.clear();
         self.gate_tests = 0;
+        self.test_masks_derived = 0;
+        self.gate_exits_tainted = 0;
+        self.gate_near_misses = 0;
+        self.gate_near_miss_by_reason.clear();
+        self.gate_test_from_regs = 0;
+        self.def_pc.clear();
+        self.def_op.clear();
+        self.gate_near_miss_nodes.clear();
+        self.unmodelled_ops_tainted = 0;
         self.mixed_regs.clear();
         self.def_masked.clear();
         self.table_load_in_block = false;
@@ -853,6 +1006,9 @@ impl PhaseBEngine {
         self.def_test.remove(&out.id);
         self.def_shift.remove(&out.id);
         if out.id > 0 {
+            self.test_regs.remove(&out.id);
+        }
+        if out.id > 0 {
             self.mixed_regs.remove(&out.id);
         }
         self.def_concrete.insert(out.id, concrete);
@@ -891,7 +1047,7 @@ impl PhaseBEngine {
     /// bit is the top bit of its width.
     fn tested_mask(&self, v: Value, size: u8) -> Option<(u64, Value)> {
         if let Value::Var(vn) = v {
-            if let Some(test) = self.def_test.get(&vn.id) {
+            if let Some(test) = self.def_test.get(&vn.id).or_else(|| self.test_regs.get(&vn.id)) {
                 return Some((test.mask, test.source));
             }
             if let Some((source, amount, left)) = self.def_shift.get(&vn.id).copied() {
@@ -916,6 +1072,14 @@ impl PhaseBEngine {
         // comparison against 0xd, which is the magic rule's job.  The mask has to
         // come from a mask or a shift on the value, or not be reported at all.
         if let Value::Var(vn) = v {
+            // A flag is not a data value: `NG`, `CY`, `ZR` and their temporaries
+            // are the *result* of a comparison, so "the sign bit of NG" is not a
+            // bit of any input byte.  Without this the fallback fired on every
+            // flag of the flag algebra -- 28 558 masks for 806 comparisons on the
+            // target, i.e. noise that would drown the few real gates.
+            if self.flag_vars.contains(&vn.id) {
+                return None;
+            }
             let derived = self.def_sub.contains_key(&vn.id)
                 || self.def_masked.contains_key(&vn.id)
                 || self.def_mixed.contains(&vn.id)
@@ -926,6 +1090,79 @@ impl PhaseBEngine {
         }
         let bits = u32::from(size.max(1)) * 8;
         Some((1u64 << bits.saturating_sub(1).min(63), v))
+    }
+
+    /// The chain of operations that produced a value, most recent first.
+    ///
+    /// A condition that reached its branch with no bit test is a chain of ops, and
+    /// each link has its own fix: a slice records nothing anywhere, a flag
+    /// computation records nothing that survives to the branch, and the width
+    /// matters because the mask rules are width-relative -- a one-byte flag is not
+    /// the width of the value it was computed from.
+    fn defining_chain(&self, v: Value, depth: usize) -> String {
+        let mut chain = String::new();
+        let mut cur = v;
+        for _ in 0..depth {
+            let Value::Var(vn) = cur
+            else {
+                break;
+            };
+            let Some((op, first)) = self.def_op.get(&vn.id).copied()
+            else {
+                break;
+            };
+            if !chain.is_empty() {
+                chain.push_str("<-");
+            }
+            chain.push_str(&format!("{op:?}"));
+            cur = first;
+        }
+        if chain.is_empty() {
+            "unknown".to_string()
+        }
+        else {
+            chain
+        }
+    }
+
+    /// Carry a bit test through a statement that merely restates it.
+    ///
+    /// The plumbing between a comparison and the branch that uses it is full of
+    /// value-preserving steps -- `NG == 0`, `(c & 0x20) == 0`, a boolean
+    /// combination of two tests -- and losing the mask at any of them is what left
+    /// the gate miner with nothing to report on the target: the branch tests the
+    /// *comparison's* output, not the value the mask was applied to.  Only
+    /// inherited when the statement does not derive a test of its own, because a
+    /// mask or a shift is the more specific statement about which bit is watched.
+    fn inherit_test(&mut self, out: VarNode, operands: &[Value]) {
+        if out.is_invalid() || self.def_test.contains_key(&out.id) {
+            return;
+        }
+        for operand in operands {
+            if let Value::Var(vn) = operand {
+                if let Some(test) =
+                    self.def_test.get(&vn.id).or_else(|| self.test_regs.get(&vn.id)).copied()
+                {
+                    self.remember_test(out, test);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Remember a bit test for `out`, at the scope its space has.
+    ///
+    /// Register-space variables keep it across blocks (`test_regs`); temporaries
+    /// are block-local by nature, so `def_test` alone.  Every write goes through
+    /// here so the two views cannot drift apart.
+    fn remember_test(&mut self, out: VarNode, test: TestInfo) {
+        if out.is_invalid() {
+            return;
+        }
+        self.def_test.insert(out.id, test);
+        if out.id > 0 {
+            self.test_regs.insert(out.id, test);
+        }
     }
 
     /// Close every bit test still waiting for its consequence.
@@ -1013,7 +1250,7 @@ impl PhaseBEngine {
                 let gated_count = bounded.len() as u64;
                 observer.on_loop_bound(source, &occs, target, count, gated_count);
                 for read in bounded {
-                    observer.on_bounded_read(read);
+                    observer.on_bounded_read(source, target, read);
                 }
             }
         }
@@ -1033,6 +1270,23 @@ impl PhaseBEngine {
             table_loads: self.table_loads,
             early_stops: self.early_stops,
             gate_tests: self.gate_tests,
+            test_masks_derived: self.test_masks_derived,
+            gate_exits_tainted: self.gate_exits_tainted,
+            gate_near_misses: self.gate_near_misses,
+            gate_near_miss_by_reason: self
+                .gate_near_miss_by_reason
+                .iter()
+                .map(|(why, n)| (*why, *n))
+                .collect(),
+            gate_test_from_regs: self.gate_test_from_regs,
+            gate_near_miss_nodes: self
+                .gate_near_miss_nodes
+                .iter()
+                .map(|((branch, def, chain, size, mask), n)| {
+                    (*branch, *def, chain.clone(), *size, *mask, *n)
+                })
+                .collect(),
+            unmodelled_ops_tainted: self.unmodelled_ops_tainted,
             panic_disarmed: self.panic_disarmed,
             evictions: self.shadow.evictions(),
         }
@@ -1141,6 +1395,8 @@ impl PhaseBEngine {
         self.def_shift.clear();
         self.cur_pc = start;
         self.cur_group_entry = start;
+        self.mask_in_block = false;
+        self.gate_reported_in_block = false;
 
         // Notify the observer about source loads only now: the block-entry hook
         // fires *before* the block runs, so the corresponding MMIO read (and
@@ -1205,6 +1461,14 @@ impl PhaseBEngine {
     /// marker-less continuation sub-block keeps the instruction PC of its parent.
     fn interpret_block(&mut self, block: &Block, env: &mut dyn ConcreteEnv) {
         for stmt in &block.pcode.instructions {
+            // Where this variable was defined, for the diagnostic that has to name
+            // the statement behind a condition (see `gate_near_miss_nodes`).
+            // Pass-scoped like `test_regs`: the condition of a block exit is
+            // routinely defined in the block before it.
+            if !stmt.output.is_invalid() {
+                self.def_pc.insert(stmt.output.id, self.cur_pc);
+                self.def_op.insert(stmt.output.id, (stmt.op, stmt.inputs.first()));
+            }
             match stmt.op {
                 Op::InstructionMarker => {
                     // Guard against synthetic blocks with a VarNode input;
@@ -1229,8 +1493,8 @@ impl PhaseBEngine {
                     // resolved per *read* by the concrete load address, which keeps
                     // a shared helper's callers' streams apart instead of merging
                     // or dropping them.
-                    let key = self.read_sites.get(&self.cur_pc).and_then(|streams| {
-                        match streams.len() {
+                    let key =
+                        self.read_sites.get(&self.cur_pc).and_then(|streams| match streams.len() {
                             0 => None,
                             1 => streams.first().copied(),
                             _ => addr.and_then(|addr| {
@@ -1239,8 +1503,7 @@ impl PhaseBEngine {
                                     .copied()
                                     .find(|stream| *stream & 0xffff_ffff == addr & 0xffff_ffff)
                             }),
-                        }
-                    });
+                        });
                     if let Some(key) = key {
                         // `occ` is assigned in interpretation order, which is the
                         // order the CPU performs the reads in.  Note that `occ`,
@@ -1259,7 +1522,10 @@ impl PhaseBEngine {
                         // the gate polling itself rather than consuming anything new.
                         for gate in self.pending_gates.iter_mut() {
                             if gate.outcome == GateOutcome::Unobserved
-                                && !gate.sources.iter().any(|s| s.pc == ctx.pc && s.addr == ctx.addr)
+                                && !gate
+                                    .sources
+                                    .iter()
+                                    .any(|s| s.pc == ctx.pc && s.addr == ctx.addr)
                             {
                                 gate.outcome = GateOutcome::Read { pc: ctx.pc, addr: ctx.addr };
                             }
@@ -1355,8 +1621,7 @@ impl PhaseBEngine {
                         // it is the firmware serving itself (the weak case).
                         for gate in self.pending_gates.iter_mut() {
                             if gate.outcome == GateOutcome::Unobserved {
-                                gate.outcome =
-                                    GateOutcome::Store { pc: self.cur_pc, device };
+                                gate.outcome = GateOutcome::Store { pc: self.cur_pc, device };
                             }
                         }
                         let val_tag = self.taint_in(stmt.inputs.second());
@@ -1418,7 +1683,12 @@ impl PhaseBEngine {
                                     let pc = self.cur_pc;
                                     if let Some(observer) = self.observer.as_mut() {
                                         observer.on_tainted_store(
-                                            &sources, pc, a, size, value, value_known,
+                                            &sources,
+                                            pc,
+                                            a,
+                                            size,
+                                            value,
+                                            value_known,
                                         );
                                     }
                                 }
@@ -1430,16 +1700,31 @@ impl PhaseBEngine {
                 Op::Copy | Op::ZeroExtend | Op::SignExtend => {
                     let src = stmt.inputs.first();
                     let c = self.concrete_in(src, env);
+                    let t = self.taint_in(src);
+                    self.set_def(stmt.output, c, t);
                     // A copy of a tested value is still that test: the flag
                     // plumbing between the comparison and the branch is full of
                     // them, and losing the mask here would lose the gate.
+                    //
+                    // *After* `set_def`, which clears the destination's derivation
+                    // notes: recording the test first is recording it into the
+                    // garbage, because the very next call wipes it.  That was the
+                    // bug that capped this firmware at one gate -- the lifter puts a
+                    // copy between every flag computation and the branch that uses
+                    // it, so the stamp died here and 729 blocks reached their branch
+                    // with no bit test at all (`cond_has_no_test`, whose defining
+                    // chains all show a `Copy` right below the value the test was
+                    // computed into).
                     if let Value::Var(vn) = src {
-                        if let Some(test) = self.def_test.get(&vn.id).copied() {
-                            self.def_test.insert(stmt.output.id, test);
+                        if let Some(test) = self
+                            .def_test
+                            .get(&vn.id)
+                            .or_else(|| self.test_regs.get(&vn.id))
+                            .copied()
+                        {
+                            self.remember_test(stmt.output, test);
                         }
                     }
-                    let t = self.taint_in(src);
-                    self.set_def(stmt.output, c, t);
 
                     // These are pure moves of the low bits, so a derived-value
                     // property travels with them: `t = x & 0xF0; r2 = t` is still
@@ -1505,7 +1790,12 @@ impl PhaseBEngine {
                     }
                 }
 
-                Op::IntAnd | Op::IntOr | Op::IntXor | Op::IntMul | Op::IntLeft | Op::IntRight
+                Op::IntAnd
+                | Op::IntOr
+                | Op::IntXor
+                | Op::IntMul
+                | Op::IntLeft
+                | Op::IntRight
                 | Op::IntSignedRight => {
                     let a = stmt.inputs.first();
                     let b = stmt.inputs.second();
@@ -1518,6 +1808,15 @@ impl PhaseBEngine {
                         _ => None,
                     };
                     self.set_def(stmt.output, c, ta.union(&tb));
+                    // A bit-manipulation of a stamped value is still about the same
+                    // bit: `flag ^ 1` and `flag & 1` are how the lifter writes the
+                    // branch conditions it cannot express as an equality (`bpl` is
+                    // `N == 0` written as an inversion).  Inherited *before* the mask
+                    // below, so a real `value & MASK` keeps its own, more specific
+                    // test.  The `tst r3,#0xc; bne` gate on the target came through
+                    // the mask path; the shift-and-sign-test loops next to it did
+                    // not, and this is the link they were missing.
+                    self.inherit_test(stmt.output, &[a, b]);
 
                     if !stmt.output.is_invalid() {
                         let mask = constant_of(a).or_else(|| constant_of(b));
@@ -1533,7 +1832,17 @@ impl PhaseBEngine {
                                 (s, Value::Const(..)) | (Value::Const(..), s) => s,
                                 _ => Value::Const(0, 1),
                             };
-                            self.def_test.insert(stmt.output.id, TestInfo { mask, source });
+                            // Counted only when the masked value is input-derived:
+                            // the run is full of `and` with a constant on clean data
+                            // (every `uxtb`, every field mask), and counting those
+                            // made the counter read 28 558 for 806 comparisons --
+                            // a diagnostic that cannot distinguish "the derivation
+                            // fires everywhere" from "the derivation is noise".
+                            if !ta.is_clean() || !tb.is_clean() {
+                                self.test_masks_derived += 1;
+                                self.mask_in_block = true;
+                            }
+                            self.remember_test(stmt.output, TestInfo { mask, source });
                             // A mask does not undo a mixing chain, though: the final
                             // `crc & 0xFFFF` before a comparison is still a checksum.
                             // Only an *already mixed* operand propagates here --
@@ -1567,8 +1876,7 @@ impl PhaseBEngine {
                             // A shift on its own is not a test, but a *sign* test on
                             // the result is: record it so `x << 7 < 0` can be read as
                             // "bit 0 of x", and `x >> 4` as "the top four bits".
-                            if matches!(stmt.op, Op::IntLeft | Op::IntRight | Op::IntSignedRight)
-                            {
+                            if matches!(stmt.op, Op::IntLeft | Op::IntRight | Op::IntSignedRight) {
                                 if let Some(amount) = constant_of(a).or_else(|| constant_of(b)) {
                                     let source = match (a, b) {
                                         (s, Value::Const(..)) | (Value::Const(..), s) => s,
@@ -1663,6 +1971,9 @@ impl PhaseBEngine {
                         _ => None,
                     };
                     self.set_def(stmt.output, c, ta.union(&tb));
+                    // `flag == 0` is still a test of whatever the flag was set
+                    // from, and the branch after it tests this comparison's output.
+                    self.inherit_test(stmt.output, &[a, b]);
                 }
 
                 Op::IntNotEqual
@@ -1688,6 +1999,7 @@ impl PhaseBEngine {
                         _ => None,
                     };
                     self.set_def(stmt.output, c, ta.union(&tb));
+                    self.inherit_test(stmt.output, &[a, b]);
                     // A *signed* comparison against zero is a sign test, i.e. a test
                     // of the top bit of its operand -- and when that operand is a
                     // shift, of the bit the shift moved up.  That is the whole gate:
@@ -1705,14 +2017,23 @@ impl PhaseBEngine {
                         };
                         if let Some((mask, source)) = mask {
                             if mask != 0 {
-                                self.def_test.insert(stmt.output.id, TestInfo { mask, source });
+                                // Input-derived only, for the same reason as above.
+                                if !self.taint_in(a).is_clean() {
+                                    self.test_masks_derived += 1;
+                                    self.mask_in_block = true;
+                                }
+                                self.remember_test(stmt.output, TestInfo { mask, source });
                             }
                         }
                     }
                 }
 
-                Op::IntDiv | Op::IntSignedDiv | Op::IntRem | Op::IntSignedRem
-                | Op::IntRotateLeft | Op::IntRotateRight => {
+                Op::IntDiv
+                | Op::IntSignedDiv
+                | Op::IntRem
+                | Op::IntSignedRem
+                | Op::IntRotateLeft
+                | Op::IntRotateRight => {
                     let ta = self.taint_in(stmt.inputs.first());
                     let tb = self.taint_in(stmt.inputs.second());
                     self.set_def(stmt.output, None, ta.union(&tb));
@@ -1725,6 +2046,14 @@ impl PhaseBEngine {
                     // mixing chain.
                     let mixed = self.operand_mixed(stmt.inputs.first());
                     self.note_mixed(stmt.output, mixed);
+                    // A bit test survives `!x`: it asks about the same bit, one
+                    // polarity away -- and `!N` is how the lifter writes `bpl`, the
+                    // branch of the shift-and-sign-test loops on the target.  Only
+                    // for `IntNot`: `IntNegate` moves every bit and the counting ops
+                    // destroy them, so an inherited mask would mean something else.
+                    if stmt.op == Op::IntNot {
+                        self.inherit_test(stmt.output, &[stmt.inputs.first()]);
+                    }
                 }
 
                 Op::BoolNot => {
@@ -1732,6 +2061,10 @@ impl PhaseBEngine {
                     let t = self.taint_in(src);
                     let c = self.concrete_in(src, env).map(|v| (v == 0) as u64);
                     self.set_def(stmt.output, c, t);
+                    // `!flag` is a test of the same bit, one polarity away: this is
+                    // the statement that was losing the stamp on the target's
+                    // `lsls`-and-`bpl` loops.
+                    self.inherit_test(stmt.output, &[src]);
                 }
 
                 Op::Select(cond) => {
@@ -1750,8 +2083,7 @@ impl PhaseBEngine {
                         _ => None,
                     };
                     self.set_def(stmt.output, c, t);
-                    let mixed =
-                        self.operand_mixed(a) || self.operand_mixed(b);
+                    let mixed = self.operand_mixed(a) || self.operand_mixed(b);
                     self.note_mixed(stmt.output, mixed);
                 }
 
@@ -1780,6 +2112,21 @@ impl PhaseBEngine {
                 Op::Hook(_) | Op::HookIf(_) => {}
 
                 _ => {
+                    // Still unmodelled: the output is clean, so taint through this op
+                    // is dropped.  Counted when the inputs were tainted, because that
+                    // is how a recognised bit test can fail to reach its branch.
+                    let mut tainted = false;
+                    // `Inputs` holds at most two values (`first`/`second`); it has no
+                    // iterators, and this is the only way to see both.
+                    for input in stmt.inputs.get() {
+                        if !self.taint_in(input).is_clean() {
+                            tainted = true;
+                            break;
+                        }
+                    }
+                    if tainted {
+                        self.unmodelled_ops_tainted += 1;
+                    }
                     if !stmt.output.is_invalid() {
                         self.set_def(stmt.output, None, TaintTag::Clean);
                     }
@@ -1787,6 +2134,14 @@ impl PhaseBEngine {
             }
         }
 
+        // Where a bit test derived in this block failed to become a gate.  Four
+        // different fixes hide behind one number: no conditional exit to branch on
+        // at all (a superblock ending in a call), an exit condition that is not
+        // input-derived, a condition no bit test was ever computed into, and a test
+        // whose taint carries no read to attribute the gate to.  The counter after
+        // the branch reports by reason, because the aggregate cannot tell them
+        // apart.
+        let mut near_miss: &'static str = "no_cond_exit";
         if let Some(Value::Var(cond)) = block.exit.cond() {
             if !cond.is_invalid() {
                 let cond_tag = self.taint_in(Value::Var(cond));
@@ -1794,15 +2149,65 @@ impl PhaseBEngine {
                 // guard, an interrupt re-entry, the same function called twice --
                 // gates a decision, and the fact that it was reached twice says
                 // nothing about how much input is consumed.
-                if !cond_tag.is_clean() {
+                if cond_tag.is_clean() {
+                    near_miss = "cond_not_tainted";
+                }
+                else {
+                    self.gate_exits_tainted += 1;
+                    near_miss = "cond_has_no_test";
                     // A condition that came out of a bit test says *which bit* the
                     // firmware watched.  That is the constraint the mutator needs
                     // (do not randomise the bit the code branches on); whether it is
                     // worth stating depends on what the gate buys, which the
                     // following code decides.
-                    if let Some(test) = self.def_test.get(&cond.id).copied() {
+                    //
+                    // The register-scoped view is consulted here too, and this is
+                    // the consumer that used to read `def_test` alone: the target's
+                    // ISR tests its status register in one block and branches on the
+                    // shifted sign in the next, so by the time the branch is
+                    // interpreted the stamp is only in `test_regs`.  Both views are
+                    // latest-definition-wins, so the fallback cannot report a test
+                    // that a later write already dropped -- but it is not scoped to
+                    // the block, which is why what it buys is counted
+                    // (`gate_test_from_regs`) rather than assumed safe.
+                    let mut from_regs = false;
+                    let test = match self.def_test.get(&cond.id).copied() {
+                        Some(test) => Some(test),
+                        None => {
+                            from_regs = true;
+                            self.test_regs.get(&cond.id).copied()
+                        }
+                    };
+                    if test.is_none() {
+                        // Nothing stamped this condition, so the miner cannot say
+                        // which bit it is about -- and that is the shape 729 of the
+                        // target's 1109 near misses are in.  Report the statement
+                        // that defined it, what kind of value it holds, and the mask
+                        // the rules *would* have inferred, so the next step is a
+                        // lookup in the disassembly rather than another guess.
+                        let defined_at = self.def_pc.get(&cond.id).copied().unwrap_or(0);
+                        let cond_size = value_size(Value::Var(cond));
+                        let defined_by = self.defining_chain(Value::Var(cond), 4);
+                        let branch_pc = self.cur_pc;
+                        let would_be = self
+                            .tested_mask(Value::Var(cond), cond_size)
+                            .map(|(mask, _)| mask)
+                            .unwrap_or(0);
+                        *self
+                            .gate_near_miss_nodes
+                            .entry((branch_pc, defined_at, defined_by, cond_size, would_be))
+                            .or_insert(0) += 1;
+                    }
+                    if let Some(test) = test {
                         let sources = self.contexts_of(&cond_tag);
-                        if !sources.is_empty() {
+                        if sources.is_empty() {
+                            near_miss = "test_without_context";
+                        }
+                        else {
+                            self.gate_reported_in_block = true;
+                            if from_regs {
+                                self.gate_test_from_regs += 1;
+                            }
                             self.pending_gates.push(PendingGate {
                                 sources,
                                 mask: test.mask,
@@ -1843,6 +2248,18 @@ impl PhaseBEngine {
                     }
                 }
             }
+        }
+
+        // A block that computed a bit test and reported no gate is the interesting
+        // case: the chain broke between the test and the branch.  Counted whatever
+        // the exit kind, so a superblock ending in a call -- which has no `cond()`
+        // at all -- cannot hide the gap.  The reason is counted with it: this
+        // population is 1109 of 1425 tainted exits on the target, and only the
+        // split says whether the plumbing loses the stamp or there was nothing to
+        // stamp.
+        if self.mask_in_block && !self.gate_reported_in_block {
+            self.gate_near_misses += 1;
+            *self.gate_near_miss_by_reason.entry(near_miss).or_insert(0) += 1;
         }
 
         // The attribution window ends when this block leaves the function (a call
@@ -2296,7 +2713,6 @@ fn creates_mixing(op: Op) -> bool {
     matches!(op, Op::IntXor | Op::IntMul | Op::IntRight | Op::IntSignedRight)
 }
 
-
 /// Comparison sites whose literal-pool discriminants have been *judged* to be
 /// contracts, each with the reason it was accepted.
 ///
@@ -2417,6 +2833,24 @@ pub struct PhaseBCounters {
     pub early_stops: u64,
     /// Bit tests on input-derived data that gated subsequent code.
     pub gate_tests: u64,
+    /// Masks recognised as a bit test (see `PhaseBEngine::test_masks_derived`).
+    pub test_masks_derived: u64,
+    /// Block exits whose condition was input-derived (see `PhaseBEngine`).
+    pub gate_exits_tainted: u64,
+    /// Blocks that derived a bit test and reported no gate (see `PhaseBEngine`).
+    pub gate_near_misses: u64,
+    /// The same total, split by where the chain broke.  Ordered by name so two
+    /// runs print identically.
+    pub gate_near_miss_by_reason: Vec<(&'static str, u64)>,
+    /// Gates whose bit test was only in the register-scoped view (see
+    /// `PhaseBEngine::gate_test_from_regs`).
+    pub gate_test_from_regs: u64,
+    /// Conditions that reached a branch with no bit test: (branch pc, pc of the
+    /// statement that defined the condition, the chain of operations that produced
+    /// it, its width, the mask the rules would have inferred, how many times).
+    pub gate_near_miss_nodes: Vec<(u64, u64, String, u8, u64, u64)>,
+    /// Unmodelled ops fed tainted data (see `PhaseBEngine::unmodelled_ops_tainted`).
+    pub unmodelled_ops_tainted: u64,
     /// Whether a panic forced the pass to disarm.
     pub panic_disarmed: bool,
     /// Bytes dropped from the shadow memory because it hit its bound.  Non-zero
@@ -2756,7 +3190,7 @@ mod tests {
         /// provenance can read the flags.
         magic_evidence: Vec<MagicEvidence>,
         loop_bounds: Vec<(AccessContext, Vec<u32>, AccessContext, u64, u64)>,
-            checksums: Vec<(Vec<AccessContext>, f32)>,
+        checksums: Vec<(Vec<AccessContext>, f32)>,
         /// Which rule and instruction each checksum event came from, in the same
         /// order as `checksums`.
         checksum_arms: Vec<ChecksumArm>,
@@ -2793,10 +3227,14 @@ mod tests {
             value: u64,
             value_known: bool,
         ) {
-            self.recorded
-                .borrow_mut()
-                .stores
-                .push((sources.to_vec(), pc, addr, size, value, value_known));
+            self.recorded.borrow_mut().stores.push((
+                sources.to_vec(),
+                pc,
+                addr,
+                size,
+                value,
+                value_known,
+            ));
         }
 
         fn on_magic_compare(
@@ -2806,10 +3244,7 @@ mod tests {
             confidence: f32,
             evidence: MagicEvidence,
         ) {
-            self.recorded
-                .borrow_mut()
-                .magics
-                .push((sources.to_vec(), value, confidence));
+            self.recorded.borrow_mut().magics.push((sources.to_vec(), value, confidence));
             self.recorded.borrow_mut().magic_evidence.push(evidence);
         }
 
@@ -2821,10 +3256,13 @@ mod tests {
             count: u64,
             gated_count: u64,
         ) {
-            self.recorded
-                .borrow_mut()
-                .loop_bounds
-                .push((source, source_occs.to_vec(), target, count, gated_count));
+            self.recorded.borrow_mut().loop_bounds.push((
+                source,
+                source_occs.to_vec(),
+                target,
+                count,
+                gated_count,
+            ));
         }
 
         fn on_checksum(
@@ -2848,10 +3286,7 @@ mod tests {
             branch_pc: u64,
             outcome: GateOutcome,
         ) {
-            self.recorded
-                .borrow_mut()
-                .gates
-                .push((sources.to_vec(), mask, branch_pc, outcome));
+            self.recorded.borrow_mut().gates.push((sources.to_vec(), mask, branch_pc, outcome));
         }
 
         fn on_table_load(&mut self, _addr_sources: &[AccessContext], _pc: u64) {
@@ -3077,10 +3512,7 @@ mod tests {
         // `>= 0x0800_0000` threshold demoted all of these, silently: they are the
         // values a firmware compares a genuinely-read word against.
         for value in [0xdead_beef_u64, 0x8950_4e47, 0x7f45_4c46] {
-            assert!(
-                !looks_like_address(value, 4),
-                "{value:#x} is a constant, not an address"
-            );
+            assert!(!looks_like_address(value, 4), "{value:#x} is a constant, not an address");
         }
         // A pointer into SRAM: the `_malloc_r` comparison the dump showed.
         assert!(looks_like_address(0x2000_0e70, 4));
@@ -3564,10 +3996,7 @@ mod tests {
             e.gating.iter().any(|(_, pc)| *pc == 0x204),
             "retiring loop 2 must not retire loop 1's gate"
         );
-        assert!(
-            !e.gating.iter().any(|(_, pc)| *pc == 0x304),
-            "loop 2's own gate must be retired"
-        );
+        assert!(!e.gating.iter().any(|(_, pc)| *pc == 0x304), "loop 2's own gate must be retired");
 
         // Loop 1 keeps running, so its reads must still be bounded.
         env.regs.insert(3, 0);
@@ -3945,7 +4374,7 @@ mod tests {
         let mut p = pcode::Block::new();
         p.push(marker(0x100));
         p.push((reg(1), Op::Load(0), reg(5)));
-        p.push((reg(2), Op::IntXor, reg(2), reg(1)));            // crc accumulates
+        p.push((reg(2), Op::IntXor, reg(2), reg(1))); // crc accumulates
         p.push((reg(3), Op::IntAnd, reg(2), Value::Const(0xffff, 4)));
         p.push((reg(4), Op::IntEqual, reg(3), Value::Const(0x4321, 4)));
         let block = lifter_block(p, 0x100, 0x110, BlockExit::invalid());
@@ -4161,11 +4590,11 @@ mod tests {
 
         let mut p1 = pcode::Block::new();
         p1.push(marker(0x200));
-        p1.push((reg(1), Op::Load(0), reg(9)));            // bound value
-        p1.push((reg(2), Op::IntLess, reg(3), reg(1)));    // counter < bound
+        p1.push((reg(1), Op::Load(0), reg(9))); // bound value
+        p1.push((reg(2), Op::IntLess, reg(3), reg(1))); // counter < bound
         let exit1 = BlockExit::Branch {
             cond: Value::Var(reg(2)),
-            target: Target::External(Value::Const(0x200, 4)),   // loop back
+            target: Target::External(Value::Const(0x200, 4)), // loop back
             fallthrough: Target::External(Value::Const(0x400, 4)),
         };
         let b1 = lifter_block(p1, 0x200, 0x208, exit1);
@@ -4395,6 +4824,57 @@ mod tests {
         );
     }
 
+    /// The bit test has to survive the `Copy` the lifter puts in front of the
+    /// branch.
+    ///
+    /// This is the shape every status-register poll in the target firmware has
+    /// (`lsls r2,r5,#0x1a; bpl`): the flag is computed from a shift and copied into
+    /// the value the branch consumes.  A copy that records the test *before*
+    /// defining its destination records it into the entry that `set_def` clears on
+    /// the next line, and the whole gate is lost -- on the target that capped the
+    /// run at one gate and left 729 blocks with a tainted condition and no bit
+    /// test.
+    #[test]
+    fn bit_test_survives_the_copy_into_the_branch() {
+        let mut e = engine();
+        e.pin_site(0x100, 0x5800_0000);
+
+        let mut p = pcode::Block::new();
+        p.push(marker(0x100));
+        p.push((reg(1), Op::Load(0), reg(5)));
+        // `r2 = r1 << 26`: the sign of that is bit 5 of the byte.
+        p.push((reg(2), Op::IntLeft, reg(1), Value::Const(0x1a, 4)));
+        p.push((reg(3), Op::IntSignedLess, reg(2), Value::Const(0, 4)));
+        // The copies the lifter inserts between the flag and the branch.
+        p.push((reg(4), Op::Copy, reg(3)));
+        p.push((reg(6), Op::Copy, reg(4)));
+        let branch = lifter_block(
+            p,
+            0x100,
+            0x108,
+            BlockExit::Branch {
+                cond: Value::Var(reg(6)),
+                target: Target::External(Value::Const(0x300, 4)),
+                fallthrough: Target::External(Value::Const(0x400, 4)),
+            },
+        );
+
+        let mut env = MockEnv::new();
+        env.regs.insert(5, 0x5800_0000);
+
+        let (observer, recorded) = Recorder::new();
+        e.set_observer(Box::new(observer));
+        e.run_block(&branch, &mut env);
+        e.emit_observations();
+
+        let recorded = recorded.borrow();
+        assert_eq!(recorded.gates.len(), 1, "{:?}", recorded.gates);
+        let (sources, mask, branch_pc, _) = &recorded.gates[0];
+        assert_eq!(*mask, 0x20, "bit 5 of the byte, through two copies");
+        assert_eq!(*branch_pc, 0x100);
+        assert_eq!(sources, &vec![AccessContext::new(0x100, 0x5800_0000)]);
+    }
+
     /// A sign test on a *derived* value is not a bit of the input.
     ///
     /// `cmp r0, #0xd` signs `r0 - 0xd`, and the `bgt`/`blt` that follows is about
@@ -4442,6 +4922,49 @@ mod tests {
             "and must not also be read as a bit of the difference: {:?}",
             recorded.gates
         );
+    }
+
+    /// The shape the target actually uses: the mask result is compared against
+    /// zero, and *that* comparison's output is what the branch tests
+    /// (`ands r1,r6; beq ...`).  The mask has to survive the comparison, or the
+    /// gate never reaches the branch -- which is exactly what happened on the
+    /// first real run (`gate_masks=0` there too, so this test would have caught
+    /// the plumbing gap).
+    #[test]
+    fn mask_test_reaches_the_branch_through_a_comparison() {
+        let mut e = engine();
+        e.pin_site(0x100, 0x5800_0000);
+
+        let mut p = pcode::Block::new();
+        p.push(marker(0x100));
+        p.push((reg(1), Op::Load(0), reg(5)));
+        p.push((reg(2), Op::IntAnd, reg(1), Value::Const(0x20, 4)));
+        // `ands r2, #0x20; beq` -- the branch tests the comparison, not the mask.
+        p.push((reg(3), Op::IntEqual, reg(2), Value::Const(0, 4)));
+        let block = lifter_block(
+            p,
+            0x100,
+            0x108,
+            BlockExit::Branch {
+                cond: Value::Var(reg(3)),
+                target: Target::External(Value::Const(0x400, 4)),
+                fallthrough: Target::External(Value::Const(0x500, 4)),
+            },
+        );
+
+        let mut env = MockEnv::new();
+        env.regs.insert(5, 0x5800_0000);
+
+        let (observer, recorded) = Recorder::new();
+        e.set_observer(Box::new(observer));
+        e.run_block(&block, &mut env);
+        e.emit_observations();
+
+        assert_eq!(e.counters().test_masks_derived, 1, "the mask was recognised");
+        let recorded = recorded.borrow();
+        assert_eq!(recorded.gates.len(), 1, "{:?}", recorded.gates);
+        assert_eq!(recorded.gates[0].1, 0x20, "the bit under test");
+        assert_eq!(recorded.gates[0].3, GateOutcome::Unobserved);
     }
 
     /// A gate whose window closes with nothing to show for it is reported as
@@ -4696,12 +5219,12 @@ mod tests {
 
         let mut p = pcode::Block::new();
         p.push(marker(0x100));
-        p.push((reg(1), Op::Load(0), reg(5)));            // r1 = input byte
+        p.push((reg(1), Op::Load(0), reg(5))); // r1 = input byte
         p.push(marker(0x104));
         p.push((reg(6), Op::Copy, Value::Const(0x2000, 4))); // table base
-        p.push((reg(7), Op::IntAdd, reg(6), reg(1)));     // entry = base + input
+        p.push((reg(7), Op::IntAdd, reg(6), reg(1))); // entry = base + input
         p.push(marker(0x108));
-        p.push((reg(8), Op::Load(0), reg(7)));            // r8 = table[input]
+        p.push((reg(8), Op::Load(0), reg(7))); // r8 = table[input]
         let block = lifter_block(p, 0x100, 0x110, BlockExit::invalid());
 
         let mut env = MockEnv::new();
@@ -4712,7 +5235,11 @@ mod tests {
         e.set_observer(Box::new(observer));
         e.run_block(&block, &mut env);
 
-        assert_eq!(recorded.borrow().table_loads, 1, "the indexed load must be seen as a table load");
+        assert_eq!(
+            recorded.borrow().table_loads,
+            1,
+            "the indexed load must be seen as a table load"
+        );
         assert!(!e.taint_in(Value::Var(reg(8))).is_clean(), "table result must stay tainted");
         assert_eq!(e.counters().table_loads, 1);
     }
@@ -4728,7 +5255,7 @@ mod tests {
         p.push(marker(0x100));
         p.push((reg(1), Op::Load(0), reg(5)));
         p.push((reg(2), Op::Copy, Value::Const(0, 4)));
-        p.push((reg(2), Op::IntXor, reg(2), reg(1)));     // mix
+        p.push((reg(2), Op::IntXor, reg(2), reg(1))); // mix
         p.push((VarNode::NONE, Op::Store(0), reg(6), reg(2)));
         let block = lifter_block(p, 0x100, 0x110, BlockExit::invalid());
 
