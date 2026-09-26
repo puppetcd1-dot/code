@@ -686,7 +686,15 @@ fn parse_u64(value: &str) -> Result<u64, std::num::ParseIntError> {
 /// 8: promoting a run of consumed bytes to payload is skipped on a stream the
 ///    profile calls a register, so that rule is no longer a stream-level way around
 ///    the relation the payload decision was just made to depend on.
-pub const ANALYSIS_SCHEMA: u32 = 8;
+/// 9: a confirmed gate carries `expected_value` and `expected_width` -- the tested
+///    read's value on the first observed sample, and how many input bytes that read
+///    consumed -- so the mutation side can *assert* the state a gate was entered in
+///    instead of only pinning the bits.  The width is part of it because the gate's
+///    span is the union over every sample (589 bytes for the target's RXNE gate)
+///    while the value is one read; writing the span would zero bytes the analysis
+///    never saw.  `None` is a real possibility (a gate whose samples never bound a
+///    fragment), not a compatibility default.
+pub const ANALYSIS_SCHEMA: u32 = 9;
 
 /// Summary of one analysis pass, for logs and reports.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -846,6 +854,18 @@ pub struct GateConstraint {
     pub weak: u32,
     /// Samples that showed no consequence inside the window.
     pub unobserved: u32,
+    /// The tested read's value on the first sample that *did* show a consequence.
+    ///
+    /// Asserting it replays the state the gate was entered in; `None` means no
+    /// observed sample bound a fragment, and the consumer falls back to pinning the
+    /// masked bits only.
+    pub expected_value: Option<u64>,
+    /// How many input bytes that read consumed.
+    ///
+    /// The value is one read's worth; the gate's span is the union over every sample,
+    /// and the two are wildly different for a polled register.  The mutator writes the
+    /// value over this many bytes.
+    pub expected_width: Option<u8>,
     /// The three states the mutation side consumes, and nothing finer:
     /// `confirmed` (every sample consumed input -- fix the bit), `candidate`
     /// (some samples were weak: report it, do not fix it), `unobserved` (nothing
@@ -1027,6 +1047,15 @@ struct GateTally {
     unobserved: u32,
     /// Input span the tested value came from, grown over the samples.
     offset: Option<(u32, u32)>,
+    /// The value the tested read held on the first *observed* sample.
+    ///
+    /// The mutation side asserts it, which is what lets a lineage that never opened
+    /// this gate still enter the code behind it: the analysis is not only saying
+    /// "bit 5 is watched", it is saying "with bit 5 set the firmware went here", and
+    /// that is a state a mutator can restore rather than only protect.
+    expected: Option<u64>,
+    /// The width of the read that produced `expected`, for the same reason.
+    expected_width: Option<u8>,
     branch_pc: u64,
 }
 
@@ -1465,6 +1494,8 @@ impl RoleCollector {
                 confirmed,
                 weak,
                 unobserved: tally.unobserved,
+                expected_value: tally.expected,
+                expected_width: tally.expected_width,
                 state: state_name,
                 confidence,
             });
@@ -2157,12 +2188,27 @@ impl PhaseBObserver for RoleCollector {
         // The span the *tested value* came from: gathered before touching the
         // tally, because that needs the state mutably.
         let mut span: Option<(u32, u32)> = None;
+        // The value this read held, from the same fragment lookup: that is the state
+        // the gate was entered in, which is what the mutation side can assert.
+        let mut value: Option<u64> = None;
+        // ... and how many bytes that read consumed: the value is one read's worth,
+        // while `span` is the union over every sample, and the mutator needs to know
+        // which of the two it is writing.
+        let mut width: Option<u8> = None;
         for source in sources {
             if let Some(fragment) = state.fragments.get(&(source.pc, source.addr, source.occ)) {
                 span = Some(match span {
                     Some((a, b)) => (a.min(fragment.offset_range.0), b.max(fragment.offset_range.1)),
                     None => fragment.offset_range,
                 });
+                value = value.or(Some(fragment.value));
+                width = width.or(Some(
+                    fragment
+                        .offset_range
+                        .1
+                        .saturating_sub(fragment.offset_range.0)
+                        .min(u32::from(u8::MAX)) as u8,
+                ));
             }
         }
         let tally = state.gate_samples.entry((first.pc, first.addr, mask)).or_default();
@@ -2174,6 +2220,13 @@ impl PhaseBObserver for RoleCollector {
                 Some((a, b)) => (a.min(span.0), b.max(span.1)),
                 None => span,
             });
+        }
+        // Only a sample that *saw* a consequence states a value: an unobserved one
+        // says nothing about what the firmware was looking at, and taking it would
+        // be inventing the state rather than replaying it.
+        if !matches!(outcome, GateOutcome::Unobserved) && tally.expected.is_none() {
+            tally.expected = value;
+            tally.expected_width = width;
         }
         match outcome {
             GateOutcome::Read { addr, .. } => *tally.reads.entry(addr).or_insert(0) += 1,
@@ -3112,6 +3165,16 @@ mod tests {
         assert_eq!(gate.stream, 0x4000);
         assert_eq!(gate.offset_range, (0, 1), "the tested byte");
         assert_eq!((gate.confirmed, gate.weak, gate.unobserved), (2, 1, 0));
+        assert_eq!(
+            gate.expected_value,
+            Some(0x20),
+            "the value the gate was entered with, from the sample that observed it"
+        );
+        assert_eq!(
+            gate.expected_width,
+            Some(1),
+            "one input byte was what the read consumed, so that is what gets written"
+        );
         assert_eq!(
             gate.state, "candidate",
             "a weak sample means report it, do not fix it"

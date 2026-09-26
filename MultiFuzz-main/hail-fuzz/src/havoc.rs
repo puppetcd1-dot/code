@@ -37,6 +37,15 @@ const POSITIONAL_MUTATIONS: &[Mutation] = &[
 /// the evidence states.
 const SEMANTIC_PROBABILITY: f32 = 0.35;
 
+/// How often a gate whose bytes are not already in the observed state is put into it.
+///
+/// Not 1.0: the closed-gate path is a path the firmware takes (device not ready), and
+/// forcing every gate open in every round would take it out of the corpus.
+const ASSERT_PROB: f64 = 0.5;
+
+/// A run of rejected draws this long is counted, once per round, as a fallback.
+const FALLBACK_STREAK: u32 = 8;
+
 /// A fuzzing stage that applies random mutations to the input.
 pub(crate) struct HavocStage {
     attempts: u32,
@@ -63,9 +72,27 @@ pub(crate) struct HavocStage {
     /// map -- the per-stream payload bytes were the only fingerprint, and nothing in
     /// the log said so.)
     contract_label: String,
+    /// The input this round's input descends from, for the per-action lines: the
+    /// evidence that justified a write lives in an ancestor's analysis, and the chain
+    /// is the only place it can be read back.
+    parent: Option<usize>,
     /// One line per evidence-driven action, one summary line per round.
     log: Option<std::io::BufWriter<std::fs::File>>,
     counts: RoundCounts,
+    /// The streams a mutation can still change something in, chosen once per round.
+    ///
+    /// Only the fallback when every draw comes back rejected: a fully pinned stream is
+    /// not here, so the discount is untouched, while the budget that used to be dropped
+    /// is spent on a stream the contract accepts.
+    acceptable: Vec<StreamKey>,
+    /// Whether this instance has already put the contract's constants into the
+    /// per-stream dictionaries.
+    ///
+    /// Per instance and not per process: a process-level `Once` means the second stage
+    /// instance -- another worker, another contract -- never injects, which a
+    /// single-run test cannot see and which makes the multi-worker deployment the
+    /// fuzzer actually uses silently unequal.
+    dict_injected: bool,
 }
 
 /// What a round spent its budget on.
@@ -79,16 +106,63 @@ struct RoundCounts {
     magic_refill: u32,
     length_boundary: u32,
     length_joint: u32,
+    delim_placed: u32,
+    asserts_effective: u32,
+    /// Gates whose bytes already said what the analysis saw: nothing to write.
+    assert_noops: u32,
+    /// Rounds where every stream was fully pinned: nothing could be changed, and the
+    /// round was skipped rather than mutating without the contract.
+    no_acceptable_stream: u32,
+    /// Rounds where the rejection streak passed `FALLBACK_STREAK` and the safety valve
+    /// chose the stream.
+    ///
+    /// A round-level event, not a per-draw one: it says "the base distribution could
+    /// not reach an acceptable stream in eight draws", which is what the audit wants
+    /// (`skipped_register` keeps counting the individual rejections).
+    fallbacks: u32,
     protected_bits: u32,
     skipped_register: u32,
     /// Mutations per stream, so the report can say where the budget went next to
     /// the byte budget (`channel` vs `register`).
     per_stream: HashMap<StreamKey, u32>,
+    /// Every evidence-driven action of the round, in order.
+    ///
+    /// The summary says how much of the budget the contract accounted for; this says
+    /// which offsets and values, so "this byte was not guessed" is checkable against
+    /// the input it produced instead of only in aggregate.
+    actions: Vec<ActionRecord>,
+}
+
+/// One evidence-driven action, as the per-action log line needs it.
+struct ActionRecord {
+    kind: crate::contract::ActionKind,
+    stream: StreamKey,
+    offset: u32,
+    value: u64,
 }
 
 impl RoundCounts {
     fn note(&mut self, key: StreamKey) {
         *self.per_stream.entry(key).or_default() += 1;
+    }
+
+    /// Count an evidence-driven action and keep it for the record.
+    ///
+    /// One funnel for every layer, so a layer cannot be added without appearing in
+    /// both the summary and the per-action lines.
+    fn record_action(
+        &mut self,
+        key: StreamKey,
+        (kind, offset, value): (crate::contract::ActionKind, u32, u64),
+    ) {
+        match kind {
+            crate::contract::ActionKind::MagicRefill => self.magic_refill += 1,
+            crate::contract::ActionKind::LengthBoundary => self.length_boundary += 1,
+            crate::contract::ActionKind::LengthJoint => self.length_joint += 1,
+            crate::contract::ActionKind::DelimPlace => self.delim_placed += 1,
+            crate::contract::ActionKind::GateAssert => self.asserts_effective += 1,
+        }
+        self.actions.push(ActionRecord { kind, stream: key, offset, value });
     }
 }
 
@@ -99,16 +173,22 @@ impl Drop for HavocStage {
         let _ = writeln!(
             log,
             "{{\"input\": {}, \"contract\": {}, \"random\": {}, \"magic_refill\": {}, \
-             \"length_boundary\": {}, \"length_joint\": {}, \"protected_bits\": {}, \
-             \"skipped_register\": {}}}",
+             \"length_boundary\": {}, \"length_joint\": {}, \"delim_placed\": {}, \
+             \"asserts_effective\": {}, \"assert_noops\": {}, \"no_acceptable_stream\": {}, \
+             \"protected_bits\": {}, \"skipped_register\": {}, \"fallbacks\": {}}}",
             self.input_id,
             serde_json::to_string(&self.contract_label).unwrap_or_else(|_| "\"?\"".into()),
             counts.random,
             counts.magic_refill,
             counts.length_boundary,
             counts.length_joint,
+            counts.delim_placed,
+            counts.asserts_effective,
+            counts.assert_noops,
+            counts.no_acceptable_stream,
             counts.protected_bits,
-            counts.skipped_register
+            counts.skipped_register,
+            counts.fallbacks
         );
         // Per stream, with the class and the payload bytes the analysis marked: the
         // share the contract produced, next to the share the budget predicted.
@@ -145,6 +225,26 @@ impl Drop for HavocStage {
                 len,
                 self.contract.pinned_bytes(*key, len),
                 gates.join(", ")
+            );
+        }
+        // Every evidence-driven action, one line each, after the round's summary:
+        // `parent` from the corpus metadata, so a lineage can be walked back to the
+        // input whose analysis justified the write.
+        for action in &self.counts.actions {
+            let _ = writeln!(
+                log,
+                "{{\"type\": \"action\", \"input\": {}, \"parent\": {}, \"kind\": {}, \
+                 \"stream\": \"{:#x}\", \
+                 \"offset\": {}, \"value\": {}}}",
+                self.input_id,
+                match self.parent {
+                    Some(parent) => parent.to_string(),
+                    None => "null".to_string(),
+                },
+                serde_json::to_string(&action.kind).unwrap_or_else(|_| "\"?\"".into()),
+                action.stream,
+                action.offset,
+                action.value
             );
         }
     }
@@ -187,7 +287,20 @@ impl StageData for HavocStage {
             .unwrap_or_else(|| "baseline".to_string());
         let log = open_action_log(fuzzer, &contract);
         announce_first_round(fuzzer, contract_path.as_deref(), &contract);
+        // Chosen once, while the contract is still ours: a factor of zero means every
+        // byte of the stream is pinned, and the rejection path already refuses those.
+        // This list exists so the budget that used to be dropped when every draw came
+        // back rejected is spent on a stream the contract accepts.
+        let acceptable: Vec<StreamKey> = streams
+            .iter()
+            .filter(|(key, len)| contract.stream_factor(*key, *len) > 0.0)
+            .map(|(key, _)| *key)
+            .collect();
 
+        if self.acceptable.is_empty() {
+            counts.no_acceptable_stream += 1;   // 本轮一次
+            // 跳过整个变异循环
+        }
         tracing::trace!(
             "[{id}] havoc for {attempts} attempts with {} max mutations",
             2_u64.pow(log2_max_mutations)
@@ -204,8 +317,11 @@ impl StageData for HavocStage {
             contract,
             input_id: id,
             contract_label,
+            parent: fuzzer.corpus[id].metadata.parent_id,
             log,
             counts: RoundCounts::default(),
+            acceptable,
+            dict_injected: false,
         })
     }
 
@@ -215,6 +331,13 @@ impl StageData for HavocStage {
         Snapshot::restore_initial(fuzzer);
         fuzzer.copy_current_input();
         fuzzer.reset_input_cursor().unwrap();
+
+        if !self.dict_injected {
+            if let Some(injected) = self.inject_constants(fuzzer) {
+                tracing::info!("injected {injected} constant(s) into the per-stream dictionaries");
+            }
+            self.dict_injected = true;
+        }
 
         self.havoc_v1(fuzzer);
 
@@ -259,25 +382,54 @@ impl StageData for HavocStage {
 impl HavocStage {
     #[allow(unused)]
     fn havoc_v1(&mut self, fuzzer: &mut Fuzzer) {
+        // A round where every stream is fully pinned: nothing can be changed.  Counted
+        // and skipped -- never "mutate anyway without the contract", which would make the
+        // arm that exists to measure the discount the one that ignores it.
+        if self.acceptable.is_empty() {
+            self.counts.no_acceptable_stream += 1;
+            return;
+        }
+
+        // Layer 1's assert half runs once per round, for every stream with an asserted
+        // gate and independently of which streams the discount accepts: it is about the
+        // state the firmware was observed in, and a stream whose bytes are otherwise
+        // pinned is exactly the one that needs it.
+        self.assert_gates(fuzzer);
+
         let data = &mut fuzzer.state.input;
 
         let mut mutations = crate::utils::rand_pow2(&mut fuzzer.rng, self.log2_max_mutations);
         let mut mutations = fuzzer.rng.gen_range(1..=self.max_mutations);
         while mutations > 0 {
-            // Select a stream to mutate.  The distribution already encodes which
-            // streams reached new code; the contract adds what the stream *is*, and
-            // the two stay separable by taking this decision as a rejection.
-            let mut key = None;
-            for _ in 0..8 {
+            // Select a stream to mutate.  The distribution already encodes which streams
+            // reached new code; the contract adds what the stream *is*, and the two stay
+            // separable by taking this decision as a rejection -- rebuilding the
+            // distribution from base x factor would merge them, and the ablation could no
+            // longer say how much of the split the contract moved.
+            //
+            // Drawn until accepted: a bounded run of rejections used to end the round and
+            // drop its remaining budget, which starves exactly the streams the contract
+            // accepts (the channel's acceptance is ~1.0 while the base distribution is
+            // dominated by sixteen device streams, so eight rejections in a row is
+            // common).  The streak is counted, and a long one falls back to the acceptable
+            // set itself: `acceptable` being non-empty does not oblige the base
+            // distribution to draw from it (a colourised stream can carry zero weight).
+            let mut streak = 0;
+            let key = loop {
                 let (candidate, _) = self.streams[self.stream_distr.sample(&mut fuzzer.rng)];
                 let len = data.streams.get(&candidate).map(|s| s.bytes.len()).unwrap_or(0);
                 if fuzzer.rng.gen_bool(self.contract.stream_factor(candidate, len)) {
-                    key = Some(candidate);
-                    break;
+                    break candidate;
                 }
                 self.counts.skipped_register += 1;
-            }
-            let Some(key) = key else { break };
+                streak += 1;
+                if streak == FALLBACK_STREAK {
+                    self.counts.fallbacks += 1;
+                }
+                if streak >= FALLBACK_STREAK * 8 {
+                    break *self.acceptable.choose(&mut fuzzer.rng).expect("checked non-empty");
+                }
+            };
             let bytes = &mut data.streams.get_mut(&key).unwrap().bytes;
 
             let local_dict = fuzzer.dict.entry(key).or_default();
@@ -404,19 +556,84 @@ impl HavocStage {
         if self.contract.is_empty() || !rng.gen_bool(f64::from(SEMANTIC_PROBABILITY)) {
             return None;
         }
-        let action = if rng.gen_bool(0.5) {
-            self.contract.pick_magic(rng, key, bytes.len()).map(Action::Magic)
+        // The layers that can say something about *this* stream, drawn among.  Drawing
+        // uniformly and letting the empty ones return `None` was throwing half the
+        // semantic budget away: the target's console has twelve asserted constants and
+        // no confirmed length field, so a fixed three-way draw spent a third of its
+        // turns asking for a boundary that does not exist.
+        let mut options: Vec<Action> = Vec::new();
+        if self.contract.has_magic(key) {
+            if let Some(refill) = self.contract.pick_magic(rng, key, bytes.len()) {
+                options.push(Action::Magic(refill));
+            }
         }
-        else {
-            self.contract.pick_length(rng, key, bytes).map(Action::Length)
-        };
-        let applied = self.contract.apply(rng, action?, bytes)?;
-        match applied.0 {
-            crate::contract::ActionKind::MagicRefill => self.counts.magic_refill += 1,
-            crate::contract::ActionKind::LengthBoundary => self.counts.length_boundary += 1,
-            crate::contract::ActionKind::LengthJoint => self.counts.length_joint += 1,
+        if self.contract.has_delim(key) {
+            if let Some(value) = self.contract.pick_delim(rng, key) {
+                options.push(Action::Delim(value));
+            }
         }
+        if self.contract.has_length(key) {
+            if let Some(field) = self.contract.pick_length(rng, key, bytes) {
+                options.push(Action::Length(field));
+            }
+        }
+        let action = *options.choose(rng)?;
+        let applied = self.contract.apply(rng, action, bytes)?;
+        self.counts.record_action(key, applied);
         Some(applied)
+    }
+
+    /// Put the contract's constants into the per-stream dictionaries.
+    ///
+    /// Returns how many entries were added, or `None` when there was nothing to add.
+    /// A multi-byte constant goes in at its own width, little-endian -- the same order
+    /// `write_value` uses, so the dictionary and the refill cannot disagree about a
+    /// field's bytes.
+    fn inject_constants(&self, fuzzer: &mut Fuzzer) -> Option<usize> {
+        let mut injected = 0;
+        for (key, values) in self.contract.magic_values() {
+            let dict = fuzzer.dict.entry(key).or_default();
+            for (value, width) in values {
+                let bytes = value.to_le_bytes();
+                if dict.add_item(&bytes[..usize::from(width).clamp(1, 8)], 1 | 2 | 4) {
+                    injected += 1;
+                }
+            }
+            dict.compute_weights();
+        }
+        (injected > 0).then_some(injected)
+    }
+
+    /// Write every asserted gate's observed state into the input, once per round.
+    ///
+    /// Two gates, both deliberate: a conditional one -- if the bytes already say what the
+    /// analysis saw there is nothing to write, counted as `assert_noops` -- and a
+    /// probabilistic one (`ASSERT_PROB`), because forcing every gate open every round
+    /// would take the closed-gate path out of the corpus.  The guard in the mutation loop
+    /// is taken *after* this pass, so a mutation inside the span is restored to the
+    /// asserted state: the assert states what the firmware saw, the pin keeps it.
+    fn assert_gates(&mut self, fuzzer: &mut Fuzzer) {
+        for (key, start, end, expected) in self.contract.asserted_gates_all() {
+            let width = u32::from(expected.width).min(end.saturating_sub(start)).max(1);
+            let current = match fuzzer.state.input.streams.get(&key) {
+                Some(stream) => crate::contract::read_value(&stream.bytes, start, width),
+                None => continue,
+            };
+            if current == expected.value {
+                self.counts.assert_noops += 1;
+                continue;
+            }
+            if !fuzzer.rng.gen_bool(ASSERT_PROB) {
+                continue;
+            }
+            let Some(stream) = fuzzer.state.input.streams.get_mut(&key) else { continue };
+            if crate::contract::write_value(&mut stream.bytes, start, width, expected.value) {
+                self.counts.record_action(
+                    key,
+                    (crate::contract::ActionKind::GateAssert, start, expected.value),
+                );
+            }
+        }
     }
 }
 
