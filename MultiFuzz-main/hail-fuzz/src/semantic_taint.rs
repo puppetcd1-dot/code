@@ -686,7 +686,7 @@ fn parse_u64(value: &str) -> Result<u64, std::num::ParseIntError> {
 /// 8: promoting a run of consumed bytes to payload is skipped on a stream the
 ///    profile calls a register, so that rule is no longer a stream-level way around
 ///    the relation the payload decision was just made to depend on.
-/// 9: a confirmed gate carries `expected_value` and `expected_width` -- the tested
+/// 9: a confirmed gate carries `expected_value` and `expected_width`
 ///    read's value on the first observed sample, and how many input bytes that read
 ///    consumed -- so the mutation side can *assert* the state a gate was entered in
 ///    instead of only pinning the bits.  The width is part of it because the gate's
@@ -694,7 +694,11 @@ fn parse_u64(value: &str) -> Result<u64, std::num::ParseIntError> {
 ///    while the value is one read; writing the span would zero bytes the analysis
 ///    never saw.  `None` is a real possibility (a gate whose samples never bound a
 ///    fragment), not a compatibility default.
-pub const ANALYSIS_SCHEMA: u32 = 9;
+/// 10: `gate_constraints` are audit data -- the mutation side no longer reads them at
+///    all (the device-state exclusion replaced what the gate pin was doing), and the
+///    bit/branch/count mix is left in place for whatever reads it next.  A consumer
+///    that still acts on gates must refuse this schema, which is why the number moved.
+pub const ANALYSIS_SCHEMA: u32 = 10;
 
 /// Summary of one analysis pass, for logs and reports.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -836,6 +840,11 @@ pub struct ChecksumSite {
 /// really gates something worth reaching.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct GateConstraint {
+    /// Audit data as of schema 10: the mutation side no longer reads gates.  It is kept
+    /// because the bit a branch watches, the branch's pc and the observation counts are
+    /// the input a VM-level hook would want, and because throwing away a measurement the
+    /// engine already makes would cost a re-run to get back.
+    ///
     /// The read site whose value is tested.
     pub source_pc: u64,
     pub stream: StreamKey,
@@ -2210,6 +2219,22 @@ impl PhaseBObserver for RoleCollector {
                         .min(u32::from(u8::MAX)) as u8,
                 ));
             }
+        }
+        // A mask has to be a mask *of the read*: `0x100` on a one-byte read is not a bit
+        // of anything the input can hold -- it is an artefact of the value having been
+        // widened before it was tested -- and it is the entry that had the consumer pin a
+        // whole protocol stream.  Clamped to the read we know the width of, dropped when
+        // nothing is left.
+        let mask = match width {
+            Some(width) if width > 0 => {
+                let room = u32::from(width) * 8;
+                let full = if room >= 64 { u64::MAX } else { (1u64 << room) - 1 };
+                mask & full
+            }
+            _ => mask,
+        };
+        if mask == 0 {
+            return;
         }
         let tally = state.gate_samples.entry((first.pc, first.addr, mask)).or_default();
         if tally.offset.is_none() {

@@ -16,19 +16,6 @@ use crate::{
     DictionaryRef, Fuzzer, Snapshot, StageData, StageExit,
 };
 
-/// Positional, length-preserving mutations.
-///
-/// Used on a stream whose bits a confirmed gate fixes: an insertion or a removal
-/// moves every byte after it, and the position the gate was measured at would stop
-/// naming the byte it describes.
-const POSITIONAL_MUTATIONS: &[Mutation] = &[
-    Mutation::BitFlip,
-    Mutation::IncDec,
-    Mutation::ReplaceByte,
-    Mutation::InterestingValue,
-    Mutation::DictReplace,
-];
-
 /// How often a stream with a semantic field gets an evidence-driven action instead
 /// of a random one.
 ///
@@ -36,12 +23,6 @@ const POSITIONAL_MUTATIONS: &[Mutation] = &[
 /// delimiters" failure mode, and the random mutations are what explore around what
 /// the evidence states.
 const SEMANTIC_PROBABILITY: f32 = 0.35;
-
-/// How often a gate whose bytes are not already in the observed state is put into it.
-///
-/// Not 1.0: the closed-gate path is a path the firmware takes (device not ready), and
-/// forcing every gate open in every round would take it out of the corpus.
-const ASSERT_PROB: f64 = 0.5;
 
 /// A run of rejected draws this long is counted, once per round, as a fallback.
 const FALLBACK_STREAK: u32 = 8;
@@ -81,8 +62,8 @@ pub(crate) struct HavocStage {
     counts: RoundCounts,
     /// The streams a mutation can still change something in, chosen once per round.
     ///
-    /// Only the fallback when every draw comes back rejected: a fully pinned stream is
-    /// not here, so the discount is untouched, while the budget that used to be dropped
+    /// Only the fallback when every draw comes back rejected: a stream with no
+    /// contract is not here, so the discount is untouched, while the budget that used to be
     /// is spent on a stream the contract accepts.
     acceptable: Vec<StreamKey>,
     /// Whether this instance has already put the contract's constants into the
@@ -107,11 +88,8 @@ struct RoundCounts {
     length_boundary: u32,
     length_joint: u32,
     delim_placed: u32,
-    asserts_effective: u32,
-    /// Gates whose bytes already said what the analysis saw: nothing to write.
-    assert_noops: u32,
-    /// Rounds where every stream was fully pinned: nothing could be changed, and the
-    /// round was skipped rather than mutating without the contract.
+    /// Rounds where no stream had a contract left to mutate: nothing could be
+    /// changed, and the round was skipped rather than mutating without a contract.
     no_acceptable_stream: u32,
     /// Rounds where the rejection streak passed `FALLBACK_STREAK` and the safety valve
     /// chose the stream.
@@ -120,7 +98,6 @@ struct RoundCounts {
     /// not reach an acceptable stream in eight draws", which is what the audit wants
     /// (`skipped_register` keeps counting the individual rejections).
     fallbacks: u32,
-    protected_bits: u32,
     skipped_register: u32,
     /// Mutations per stream, so the report can say where the budget went next to
     /// the byte budget (`channel` vs `register`).
@@ -160,7 +137,6 @@ impl RoundCounts {
             crate::contract::ActionKind::LengthBoundary => self.length_boundary += 1,
             crate::contract::ActionKind::LengthJoint => self.length_joint += 1,
             crate::contract::ActionKind::DelimPlace => self.delim_placed += 1,
-            crate::contract::ActionKind::GateAssert => self.asserts_effective += 1,
         }
         self.actions.push(ActionRecord { kind, stream: key, offset, value });
     }
@@ -174,8 +150,8 @@ impl Drop for HavocStage {
             log,
             "{{\"input\": {}, \"contract\": {}, \"random\": {}, \"magic_refill\": {}, \
              \"length_boundary\": {}, \"length_joint\": {}, \"delim_placed\": {}, \
-             \"asserts_effective\": {}, \"assert_noops\": {}, \"no_acceptable_stream\": {}, \
-             \"protected_bits\": {}, \"skipped_register\": {}, \"fallbacks\": {}}}",
+             \"no_acceptable_stream\": {}, \
+             \"skipped_register\": {}, \"fallbacks\": {}}}",
             self.input_id,
             serde_json::to_string(&self.contract_label).unwrap_or_else(|_| "\"?\"".into()),
             counts.random,
@@ -183,10 +159,7 @@ impl Drop for HavocStage {
             counts.length_boundary,
             counts.length_joint,
             counts.delim_placed,
-            counts.asserts_effective,
-            counts.assert_noops,
             counts.no_acceptable_stream,
-            counts.protected_bits,
             counts.skipped_register,
             counts.fallbacks
         );
@@ -206,25 +179,16 @@ impl Drop for HavocStage {
                 .unwrap_or(0);
             // The protected (stream, offset span, mask) triples: the span is what the
             // mutator pins, the mask is the bit the firmware branches on.
-            let gates: Vec<String> = self
-                .contract
-                .protected_spans(*key)
-                .into_iter()
-                .map(|(start, end, mask)| format!("\"{start}-{end}:{mask:#x}\""))
-                .collect();
             let _ = writeln!(
                 log,
                 "{{\"input\": {}, \"stream\": \"{:#x}\", \"class\": \"{}\", \
-                 \"mutations\": {}, \"payload_bytes\": {}, \"bytes\": {}, \"pinned\": {}, \
-                 \"gates\": [{}]}}",
+                 \"mutations\": {}, \"payload_bytes\": {}, \"bytes\": {}}}",
                 self.input_id,
                 key,
                 self.contract.class(*key).name(),
                 mutations,
                 self.contract.payload_bytes(*key),
                 len,
-                self.contract.pinned_bytes(*key, len),
-                gates.join(", ")
             );
         }
         // Every evidence-driven action, one line each, after the round's summary:
@@ -297,10 +261,6 @@ impl StageData for HavocStage {
             .map(|(key, _)| *key)
             .collect();
 
-        if self.acceptable.is_empty() {
-            counts.no_acceptable_stream += 1;   // 本轮一次
-            // 跳过整个变异循环
-        }
         tracing::trace!(
             "[{id}] havoc for {attempts} attempts with {} max mutations",
             2_u64.pow(log2_max_mutations)
@@ -385,20 +345,15 @@ impl HavocStage {
         // A round where every stream is fully pinned: nothing can be changed.  Counted
         // and skipped -- never "mutate anyway without the contract", which would make the
         // arm that exists to measure the discount the one that ignores it.
+        
         if self.acceptable.is_empty() {
             self.counts.no_acceptable_stream += 1;
             return;
         }
 
-        // Layer 1's assert half runs once per round, for every stream with an asserted
-        // gate and independently of which streams the discount accepts: it is about the
-        // state the firmware was observed in, and a stream whose bytes are otherwise
-        // pinned is exactly the one that needs it.
-        self.assert_gates(fuzzer);
-
         let data = &mut fuzzer.state.input;
 
-        let mut mutations = crate::utils::rand_pow2(&mut fuzzer.rng, self.log2_max_mutations);
+        //let mut mutations = crate::utils::rand_pow2(&mut fuzzer.rng, self.log2_max_mutations);
         let mut mutations = fuzzer.rng.gen_range(1..=self.max_mutations);
         while mutations > 0 {
             // Select a stream to mutate.  The distribution already encodes which streams
@@ -447,12 +402,6 @@ impl HavocStage {
             let num_mutations = fuzzer.rng.gen_range(1..=mutations.min(max_mutations_for_stream));
             mutations -= num_mutations;
             for _ in 0..num_mutations {
-                // Layer 1: the bits a confirmed gate fixes are not the mutator's to
-                // set.  The values are taken before the mutation and put back after
-                // it, so a mutation that also changed the rest of the byte survives:
-                // the gate is about the bit, not about the byte.
-                let guard = self.contract.guard(key, bytes);
-
                 // Layer 2: with probability, act on the evidence instead of at
                 // random -- a random byte mutation cannot express "write the constant
                 // this comparison expects, at this position".
@@ -470,31 +419,14 @@ impl HavocStage {
                 else {
                     // Layer 3/4: a random mutation -- positional when a bit of this
                     // stream is protected, free otherwise.
-                    let mutation = if guard.is_empty() {
-                        self.mutator.havoc_bytes(
-                            &mut fuzzer.rng,
-                            dict,
-                            bytes,
-                            key,
-                            &fuzzer.corpus,
-                            0,
-                        )
-                    }
-                    else {
-                        let kind = *POSITIONAL_MUTATIONS
-                            .choose(&mut fuzzer.rng)
-                            .unwrap_or(&Mutation::BitFlip);
-                        mutations::apply_mutation(
-                            kind,
-                            &mut fuzzer.rng,
-                            dict,
-                            bytes,
-                            key,
-                            &fuzzer.corpus,
-                            0,
-                        );
-                        Some(kind)
-                    };
+                    let mutation = self.mutator.havoc_bytes(
+                        &mut fuzzer.rng,
+                        dict,
+                        bytes,
+                        key,
+                        &fuzzer.corpus,
+                        0,
+                    );
                     if let Some(mutation) = mutation {
                         fuzzer.state.mutation_kinds.push((key, mutation).into());
                         self.counts.random += 1;
@@ -502,14 +434,6 @@ impl HavocStage {
                     }
                 }
 
-                // Layer 1 has the last word, whichever layer acted: a refill that
-                // landed on a protected bit (a constant sharing a position with a
-                // gate) is put back, which is the same precedence the report uses
-                // when a gate and a magic collide.
-                if !guard.is_empty() {
-                    self.counts.protected_bits +=
-                        Contract::restore_protected(bytes, &guard) as u32;
-                }
             }
         }
     }
@@ -604,39 +528,7 @@ impl HavocStage {
         (injected > 0).then_some(injected)
     }
 
-    /// Write every asserted gate's observed state into the input, once per round.
-    ///
-    /// Two gates, both deliberate: a conditional one -- if the bytes already say what the
-    /// analysis saw there is nothing to write, counted as `assert_noops` -- and a
-    /// probabilistic one (`ASSERT_PROB`), because forcing every gate open every round
-    /// would take the closed-gate path out of the corpus.  The guard in the mutation loop
-    /// is taken *after* this pass, so a mutation inside the span is restored to the
-    /// asserted state: the assert states what the firmware saw, the pin keeps it.
-    fn assert_gates(&mut self, fuzzer: &mut Fuzzer) {
-        for (key, start, end, expected) in self.contract.asserted_gates_all() {
-            let width = u32::from(expected.width).min(end.saturating_sub(start)).max(1);
-            let current = match fuzzer.state.input.streams.get(&key) {
-                Some(stream) => crate::contract::read_value(&stream.bytes, start, width),
-                None => continue,
-            };
-            if current == expected.value {
-                self.counts.assert_noops += 1;
-                continue;
-            }
-            if !fuzzer.rng.gen_bool(ASSERT_PROB) {
-                continue;
-            }
-            let Some(stream) = fuzzer.state.input.streams.get_mut(&key) else { continue };
-            if crate::contract::write_value(&mut stream.bytes, start, width, expected.value) {
-                self.counts.record_action(
-                    key,
-                    (crate::contract::ActionKind::GateAssert, start, expected.value),
-                );
-            }
-        }
-    }
 }
-
 /// Where the contract lives.
 ///
 /// Searched in order, and the one that was used is logged at info level, because
